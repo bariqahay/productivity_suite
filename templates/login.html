@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Login — Productivity Suite PT Telkom Indonesia">
+    <title>Login — Telkom Enterprise</title>
+
+    <!-- Google Fonts: Plus Jakarta Sans + Inter -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet">
+
+    <!-- Custom CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body class="login-page">
+
+    <div class="login-container">
+        <!-- Logo Telkom -->
+        <img
+            src="{{ url_for('static', filename='assets/telkom_logo.png') }}"
+            alt="Telkom Indonesia"
+            class="login-logo"
+        >
+
+        <!-- Login Card -->
+        <div class="login-card card">
+            <h1 class="headline-md login-card__title">Masuk ke Productivity Suite</h1>
+            <p class="body-md text-muted login-card__subtitle">
+                Silakan masukkan kredensial admin Anda
+            </p>
+
+            <!-- Form Login -->
+            <form id="loginForm" autocomplete="off">
+                <div class="form-group">
+                    <label for="loginUsername" class="form-label">Username</label>
+                    <input
+                        type="text"
+                        id="loginUsername"
+                        class="form-input"
+                        placeholder="Masukkan username"
+                        required
+                        autocomplete="username"
+                    >
+                </div>
+
+                <div class="form-group">
+                    <label for="loginPassword" class="form-label">Password</label>
+                    <input
+                        type="password"
+                        id="loginPassword"
+                        class="form-input"
+                        placeholder="Masukkan password"
+                        required
+                        autocomplete="current-password"
+                    >
+                </div>
+
+                <!-- Error Banner -->
+                <div class="banner banner--error" id="loginErrorBanner">
+                    <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="15" y1="9" x2="9" y2="15"/>
+                        <line x1="9" y1="9" x2="15" y2="15"/>
+                    </svg>
+                    <span id="loginErrorMessage">Username atau password salah</span>
+                </div>
+
+                <!-- Lockout Banner -->
+                <div class="banner banner--error" id="lockoutBanner">
+                    <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                    </svg>
+                    <span id="lockoutMessage">Akun terkunci</span>
+                </div>
+
+                <button type="submit" class="btn btn-primary btn--full-width" id="loginSubmitBtn">
+                    Masuk
+                </button>
+            </form>
+        </div>
+
+        <p class="login-footer body-md text-muted">
+            PT Telkom Indonesia — Enterprise Division
+        </p>
+    </div>
+
+    <!-- ======================================== -->
+    <!-- FACE VERIFICATION MODAL -->
+    <!-- ======================================== -->
+    <div class="face-modal" id="faceModal">
+        <div class="face-modal__backdrop" id="faceModalBackdrop"></div>
+        <div class="face-modal__content card">
+            <h2 class="title-sm face-modal__title">Verifikasi Wajah</h2>
+            <p class="body-md text-muted face-modal__desc">
+                Arahkan wajah Anda ke kamera untuk verifikasi identitas
+            </p>
+
+            <!-- Webcam Preview -->
+            <div class="webcam-container" id="webcamContainer">
+                <video id="webcamVideo" class="webcam-preview" autoplay playsinline muted></video>
+                <canvas id="webcamCanvas" style="display: none;"></canvas>
+
+                <!-- Placeholder ketika kamera belum aktif -->
+                <div class="webcam-placeholder" id="webcamPlaceholder">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                        <circle cx="12" cy="13" r="4"/>
+                    </svg>
+                    <span>Memulai kamera...</span>
+                </div>
+            </div>
+
+            <!-- Status Messages -->
+            <div class="face-modal__status" id="faceStatus">
+                <!-- Processing -->
+                <div class="face-status-item face-status--processing" id="faceProcessing" style="display: none;">
+                    <div class="loading-spinner loading-spinner--sm"></div>
+                    <span>Memverifikasi wajah...</span>
+                </div>
+
+                <!-- Success -->
+                <div class="banner banner--success face-status-item" id="faceSuccessBanner" style="display: none;">
+                    <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                        <polyline points="22 4 12 14.01 9 11.01"/>
+                    </svg>
+                    <span id="faceSuccessMessage">Verifikasi berhasil! Mengalihkan...</span>
+                </div>
+
+                <!-- Failed -->
+                <div class="banner banner--error face-status-item" id="faceFailBanner" style="display: none;">
+                    <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="12" cy="12" r="10"/>
+                        <line x1="15" y1="9" x2="9" y2="15"/>
+                        <line x1="9" y1="9" x2="15" y2="15"/>
+                    </svg>
+                    <span id="faceFailMessage">Wajah tidak dikenali</span>
+                </div>
+            </div>
+
+            <!-- Attempts Counter -->
+            <div class="face-modal__attempts" id="faceAttempts">
+                <span class="label-caps">Percobaan <span id="attemptCurrent">0</span>/<span id="attemptMax">3</span></span>
+            </div>
+
+            <!-- Buttons -->
+            <div class="face-modal__actions">
+                <button type="button" class="btn btn-primary btn--full-width" id="captureBtn" onclick="captureFrame()">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+                        <circle cx="12" cy="13" r="4"/>
+                    </svg>
+                    Ambil Foto
+                </button>
+
+                <!-- Upload Fallback -->
+                <div class="face-modal__upload-fallback" id="uploadFallback" style="display: none;">
+                    <p class="body-md text-muted">Kamera tidak tersedia. Upload foto sebagai alternatif:</p>
+                    <label for="faceUploadInput" class="btn btn-secondary btn--full-width">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                        Upload Foto
+                    </label>
+                    <input type="file" id="faceUploadInput" accept="image/*" capture="user" style="display: none;">
+                </div>
+
+                <button type="button" class="btn btn-ghost btn--full-width" id="retryBtn" onclick="retryFaceCapture()" style="display: none;">
+                    Coba Lagi
+                </button>
+
+                <button type="button" class="btn btn-ghost btn--full-width" id="cancelFaceBtn" onclick="cancelFaceVerification()">
+                    Batal
+                </button>
+            </div>
+
+            <!-- Lockout Timer di Modal -->
+            <div class="face-modal__lockout" id="faceLockout" style="display: none;">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+                    <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+                </svg>
+                <span>Akun terkunci. Coba lagi dalam <strong id="lockoutTimerDisplay">0:00</strong></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom JavaScript -->
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    <script>
+        // Inisialisasi form login saat halaman dimuat
+        document.addEventListener('DOMContentLoaded', function() {
+            initLoginForm();
+        });
+    </script>
+</body>
+</html>

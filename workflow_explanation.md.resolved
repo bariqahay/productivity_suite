@@ -1,0 +1,100 @@
+# Workflow — Telkom Productivity Suite
+
+---
+
+## 1. Arsitektur Sistem
+
+Aplikasi dibangun dengan **Flask** menggunakan pola **Application Factory** (`create_app()`) dan **Blueprint** untuk memisahkan modul: `auth`, `absensi`, `dashboard`, `artikel`. Google Sheets berfungsi sebagai database utama melalui **gspread** — semua operasi CRUD (read, append) melewati modul `utils/sheets.py` yang dilengkapi cache TTL 60 detik.
+
+Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisnis dari routing:
+
+| Modul | Tanggung Jawab |
+|---|---|
+| [sheets.py](file:///c:/Users/rifki/Documents/projek_magang/utils/sheets.py) | CRUD Google Sheets + caching |
+| [face_auth.py](file:///c:/Users/rifki/Documents/projek_magang/utils/face_auth.py) | Face encoding, verifikasi wajah |
+| [telegram.py](file:///c:/Users/rifki/Documents/projek_magang/utils/telegram.py) | Notifikasi Telegram Bot |
+| [image_gen.py](file:///c:/Users/rifki/Documents/projek_magang/utils/image_gen.py) | Word cloud generation |
+
+---
+
+## 2. Workflow Per Fitur
+
+### Absensi
+1. Halaman memuat **daftar karyawan** dari sheet `Karyawan` untuk dropdown
+2. User memilih nama, status (Hadir/Izin/Sakit/WFH), dan catatan
+3. Submit → `append_row()` ke sheet `Absensi` **dan** `Audit_Log`
+4. Notifikasi dikirim ke **grup Telegram** via Bot API
+5. Tabel audit log (20 record terakhir) di-refresh otomatis via `/api/log`
+
+### Login + Face Verification
+1. User input username + password → divalidasi terhadap `ADMIN_USERS` di `.env`
+2. Jika password valid **dan** foto referensi ada → masuk tahap **face verification**
+3. Webcam capture → base64 → `verify_face()` membandingkan encoding dengan `face_recognition` (atau fallback **Haar Cascade + histogram**)
+4. Gagal 3× berturut-turut → akun **lockout** selama `LOCKOUT_MINUTES`
+5. Setiap percobaan (sukses/gagal) dicatat ke sheet `Login_Log`
+
+### Dashboard
+1. Data diambil dari sheet `Absensi` → di-filter per periode (week/month/all)
+2. Diolah dengan **Pandas** menjadi: kehadiran harian (bar), distribusi status (donut), tren mingguan (line)
+3. **K-Means Clustering** (`sklearn`) mengelompokkan karyawan menjadi 3 kluster: Konsisten, Sering Izin, Tidak Konsisten
+4. Visualisasi di-render client-side dengan **Chart.js**
+5. Data bisa di-export ke **Excel (.xlsx)** via `openpyxl`
+
+### Artikel Generator
+1. User input topik, keywords, tone (formal/santai), panjang (pendek/sedang/panjang)
+2. Prompt dikirim ke **Groq API** dengan model **LLaMA 3.3 70B**
+3. Hasil artikel di-generate → otomatis dibuat **word cloud** (colormap `Reds`)
+4. Word cloud di-cache per session berdasarkan **MD5 hash** artikel
+5. Artikel bisa di-download sebagai **.docx** (via `python-docx`), word cloud sebagai **.png**
+
+---
+
+## 3. Alur Data
+
+```
+┌──────────┐     HTTP/JSON     ┌──────────────────────┐
+│          │ ───────────────▶  │   Flask App          │
+│  Browser │                   │  ┌────────────────┐  │
+│  (User)  │                   │  │  Blueprints     │  │
+│          │  ◀───────────────  │  │  auth │ absensi│  │
+└──────────┘     HTML/JSON     │  │  dash │ artikel│  │
+                               │  └───────┬────────┘  │
+                               │          │           │
+                               │  ┌───────▼────────┐  │
+                               │  │  utils/         │  │
+                               │  │  service layer  │  │
+                               │  └──┬──┬──┬──┬────┘  │
+                               └─────┼──┼──┼──┼───────┘
+                                     │  │  │  │
+                    ┌────────────────┘  │  │  └──────────────────┐
+                    ▼                   ▼  ▼                     ▼
+            ┌──────────────┐  ┌──────────┐ ┌───────────┐  ┌───────────┐
+            │ Google Sheets│  │ Telegram │ │ Groq API  │  │ Webcam    │
+            │ (Database)   │  │ Bot API  │ │ LLaMA 3.3 │  │ face_rec  │
+            │              │  │          │ │           │  │ / OpenCV  │
+            │ • Karyawan   │  └──────────┘ └───────────┘  └───────────┘
+            │ • Absensi    │
+            │ • Audit_Log  │
+            │ • Login_Log  │
+            └──────────────┘
+```
+
+---
+
+## 4. Justifikasi Akademik Per Matkul
+
+| Mata Kuliah | Justifikasi |
+|---|---|
+| **Internet of Things** | Integrasi Telegram Bot API sebagai kanal notifikasi real-time saat karyawan melakukan absensi — mensimulasikan komunikasi perangkat-ke-pengguna dalam ekosistem IoT |
+| **Forensik Digital** | Pencatatan login attempt (timestamp, IP, status, metode) ke sheet `Login_Log` dan mekanisme lockout berfungsi sebagai **audit trail** untuk analisis forensik keamanan |
+| **Pengolahan Citra Digital** | Modul `face_auth.py` menggunakan `face_recognition` (128D face encoding) dan fallback **Haar Cascade + histogram correlation** di OpenCV untuk verifikasi identitas berbasis citra wajah |
+| **Big Data** | Google Sheets sebagai data store terdistribusi, caching TTL untuk efisiensi query, serta pengolahan batch data kehadiran dengan Pandas (filtering, grouping, aggregation) |
+| **Penambangan Data** | Implementasi **K-Means Clustering** dengan `StandardScaler` normalisasi untuk mengelompokkan pola kehadiran karyawan menjadi 3 kluster (Konsisten, Sering Izin, Tidak Konsisten) |
+
+---
+
+## 5. Potensi Pengembangan
+
+1. **Multi-tenant & RBAC** — Menambahkan role (admin, supervisor, karyawan) dengan hak akses berbeda, serta dukungan multi-divisi/kantor cabang
+2. **Geofencing + GPS** — Integrasi lokasi GPS saat absensi untuk validasi kehadiran on-site vs WFH, bisa dikombinasikan dengan sensor IoT di kantor
+3. **Migrasi ke PostgreSQL + Dashboard Real-time** — Mengganti Google Sheets dengan database relasional untuk skalabilitas, lalu menambahkan WebSocket agar dashboard terupdate secara real-time tanpa polling

@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+{% block title %}Artikel Generator{% endblock %}
+
+{% block content %}
+<!-- Judul halaman -->
+<h1 class="display-lg mb-32">Artikel Generator</h1>
+
+<!-- Layout 2 kolom: Form (40%) + Preview (60%) -->
+<div class="artikel-layout">
+    <!-- Kolom Kiri: Form -->
+    <div class="card" id="artikel-form-card">
+        <form id="artikelForm" autocomplete="off">
+            <!-- Topik Artikel -->
+            <div class="form-group">
+                <label for="topikArtikel" class="form-label">Topik Artikel</label>
+                <input
+                    type="text"
+                    id="topikArtikel"
+                    name="topik"
+                    class="form-input"
+                    placeholder="Contoh: Transformasi Digital di Indonesia"
+                    required
+                >
+            </div>
+
+            <!-- Keywords -->
+            <div class="form-group">
+                <label for="keywords" class="form-label">Keywords</label>
+                <input
+                    type="text"
+                    id="keywords"
+                    name="keywords"
+                    class="form-input"
+                    placeholder="Contoh: AI, cloud, enterprise"
+                >
+                <div class="form-hint">Pisahkan dengan koma</div>
+            </div>
+
+            <!-- Tone -->
+            <div class="form-group">
+                <label class="form-label">Tone</label>
+                <div class="segmented-control segmented-control--full-width" id="toneControl">
+                    <button
+                        type="button"
+                        class="segmented-control__btn segmented-control__btn--active segmented-control__btn--flex"
+                        data-tone="formal"
+                        onclick="setTone('formal', this)"
+                    >Formal</button>
+                    <button
+                        type="button"
+                        class="segmented-control__btn segmented-control__btn--flex"
+                        data-tone="santai"
+                        onclick="setTone('santai', this)"
+                    >Santai</button>
+                </div>
+            </div>
+
+            <!-- Panjang Artikel -->
+            <div class="form-group mb-24">
+                <label for="panjangArtikel" class="form-label">Panjang Artikel</label>
+                <input
+                    type="range"
+                    id="panjangArtikel"
+                    name="panjang"
+                    class="range-slider"
+                    min="0"
+                    max="2"
+                    value="1"
+                    step="1"
+                >
+                <div class="range-labels">
+                    <span>Pendek</span>
+                    <span>Sedang</span>
+                    <span>Panjang</span>
+                </div>
+            </div>
+
+            <!-- Banner Error -->
+            <div class="banner banner--error" id="artikelErrorBanner">
+                <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="15" y1="9" x2="9" y2="15"/>
+                    <line x1="9" y1="9" x2="15" y2="15"/>
+                </svg>
+                <span id="artikelErrorMessage">Terjadi kesalahan</span>
+            </div>
+
+            <!-- Tombol Generate -->
+            <button type="submit" class="btn btn-primary btn--full-width" id="generateBtn">
+                Generate Artikel
+            </button>
+        </form>
+    </div>
+
+    <!-- Kolom Kanan: Preview -->
+    <div class="card" id="artikel-preview-card">
+        <!-- Preview Artikel -->
+        <h3 class="title-sm mb-16">Preview Artikel</h3>
+        <textarea
+            id="artikelPreview"
+            class="preview-textarea mb-24"
+            readonly
+            placeholder="Hasil artikel akan muncul di sini setelah generate..."
+        ></textarea>
+
+        <!-- Word Cloud Preview -->
+        <h3 class="title-sm mb-16">Word Cloud Artikel</h3>
+        <div class="wordcloud-preview mb-24" id="wordcloudPreview">
+            <div class="wordcloud-preview__placeholder" id="wordcloudPlaceholder">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <span class="body-md">Word cloud muncul setelah generate</span>
+            </div>
+            <img id="wordcloudImage" src="" alt="Word cloud artikel" style="display: none;">
+        </div>
+
+        <!-- Tombol Download -->
+        <div class="download-buttons">
+            <button
+                class="btn btn-secondary"
+                id="downloadDocxBtn"
+                onclick="downloadDocx()"
+                disabled
+            >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                </svg>
+                Download .docx
+            </button>
+            <button
+                class="btn btn-secondary"
+                id="downloadWordcloudBtn"
+                onclick="downloadWordcloud()"
+                disabled
+            >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+                    <circle cx="8.5" cy="8.5" r="1.5"/>
+                    <polyline points="21 15 16 10 5 21"/>
+                </svg>
+                Download Word Cloud .png
+            </button>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Inisialisasi form artikel setelah DOM siap
+    document.addEventListener('DOMContentLoaded', function() {
+        initArtikelForm();
+    });
+</script>
+{% endblock %}

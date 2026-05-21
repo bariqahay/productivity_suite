@@ -1,0 +1,33 @@
+# === Environment & Credentials ===
+.env
+credentials.json
+
+# === Python ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# === Virtual Environment ===
+.venv/
+venv/
+env/
+
+# === Foto Referensi Admin (sensitif) ===
+static/assets/admin_faces/
+
+# === IDE & Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS Generated ===
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# === Gemini/AI Tooling ===
+.gemini/

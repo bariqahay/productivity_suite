@@ -1,0 +1,153 @@
+{% extends "base.html" %}
+{% block title %}Absensi{% endblock %}
+
+{% block content %}
+<!-- Judul halaman -->
+<h1 class="display-lg mb-8">Absensi</h1>
+<p class="subtitle mb-32">Catat kehadiran harian</p>
+
+<!-- Layout 2 kolom: Form + Pengumuman -->
+<div class="absensi-top-layout">
+    <!-- Form Card (55%) -->
+    <div class="card absensi-form-card" id="absensi-form-card">
+        <form id="absensiForm" autocomplete="off">
+            <!-- Nama Karyawan -->
+            <div class="form-group">
+                <label for="namaKaryawan" class="form-label">Nama Karyawan</label>
+                <select id="namaKaryawan" name="nama" class="form-select" required>
+                    <option value="" disabled selected>Pilih karyawan</option>
+                    {% for nama in karyawan_list %}
+                    <option value="{{ nama }}">{{ nama }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <!-- Status Kehadiran -->
+            <div class="form-group">
+                <label for="statusKehadiran" class="form-label">Status</label>
+                <select id="statusKehadiran" name="status" class="form-select" required>
+                    <option value="" disabled selected>Pilih status</option>
+                    <option value="Hadir">Hadir</option>
+                    <option value="Izin">Izin</option>
+                    <option value="Sakit">Sakit</option>
+                    <option value="WFH">WFH</option>
+                </select>
+            </div>
+
+            <!-- Catatan -->
+            <div class="form-group mb-24">
+                <label for="catatan" class="form-label">Catatan (Opsional)</label>
+                <textarea
+                    id="catatan"
+                    name="catatan"
+                    class="form-textarea"
+                    placeholder="Tambahkan catatan jika perlu..."
+                    rows="3"
+                ></textarea>
+            </div>
+
+            <!-- Banner Sukses (tersembunyi default) -->
+            <div class="banner banner--success" id="successBanner">
+                <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/>
+                    <polyline points="22 4 12 14.01 9 11.01"/>
+                </svg>
+                <span id="successMessage">Absensi berhasil dicatat</span>
+            </div>
+
+            <!-- Banner Error (tersembunyi default) -->
+            <div class="banner banner--error" id="errorBanner">
+                <svg class="banner__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="15" y1="9" x2="9" y2="15"/>
+                    <line x1="9" y1="9" x2="15" y2="15"/>
+                </svg>
+                <span id="errorMessage">Terjadi kesalahan</span>
+            </div>
+
+            <!-- Tombol Submit -->
+            <button type="submit" class="btn btn-primary btn--full-width" id="submitBtn">
+                Catat Kehadiran
+            </button>
+        </form>
+    </div>
+
+    <!-- Announcement Card (45%) -->
+    <div class="card announcement-card" id="announcement-card">
+        <div class="announcement-card__header">
+            <!-- Ikon megaphone -->
+            <svg class="announcement-card__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/>
+                <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+            </svg>
+            <h2 class="title-sm">Pengumuman</h2>
+        </div>
+        <div class="announcement-card__body">
+            {% if announcement_text %}
+                <p class="body-md">{{ announcement_text }}</p>
+            {% else %}
+                <p class="body-md text-placeholder">Tidak ada pengumuman saat ini.</p>
+            {% endif %}
+        </div>
+        {% if announcement_date %}
+        <div class="announcement-card__footer">
+            <span class="label-caps">Diperbarui: {{ announcement_date }}</span>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<!-- Audit Log / Riwayat Kehadiran -->
+<section class="audit-log-section">
+    <h2 class="title-sm mb-16">Log Aktivitas</h2>
+    <div class="card card--compact">
+        <div class="data-table-wrapper">
+            <table class="data-table" id="auditLogTable">
+                <thead>
+                    <tr>
+                        <th style="width: 180px;">Timestamp</th>
+                        <th>Nama</th>
+                        <th style="width: 120px;">Status</th>
+                        <th>Catatan</th>
+                    </tr>
+                </thead>
+                <tbody id="auditLogBody">
+                    {% if audit_log %}
+                        {% for row in audit_log %}
+                        <tr>
+                            <td>{{ row.Timestamp }}</td>
+                            <td>{{ row.Nama }}</td>
+                            <td>
+                                {% if row.Status == 'Hadir' or row.Status == 'WFH' %}
+                                    <span class="chip chip--success">{{ row.Status }}</span>
+                                {% elif row.Status == 'Izin' %}
+                                    <span class="chip chip--pending">{{ row.Status }}</span>
+                                {% elif row.Status == 'Sakit' %}
+                                    <span class="chip chip--critical">{{ row.Status }}</span>
+                                {% else %}
+                                    <span class="chip">{{ row.Status }}</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ row.Catatan or '-' }}</td>
+                        </tr>
+                        {% endfor %}
+                    {% else %}
+                        <tr>
+                            <td colspan="4" class="empty-state">Belum ada data kehadiran</td>
+                        </tr>
+                    {% endif %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    // Inisialisasi form absensi setelah DOM siap
+    document.addEventListener('DOMContentLoaded', function() {
+        initAbsensiForm();
+    });
+</script>
+{% endblock %}
