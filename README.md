@@ -13,13 +13,13 @@ Aplikasi web multi-halaman berbasis **Flask** untuk manajemen kehadiran, dashboa
 
 ## Mapping Mata Kuliah ke Fitur
 
-| Mata Kuliah                      | Implementasi                                                              |
-|----------------------------------|---------------------------------------------------------------------------|
-| Pemrograman Web                  | Flask app, Jinja2 templates, REST API, JavaScript frontend                |
-| Basis Data                       | Google Sheets sebagai database (CRUD via gspread)                         |
-| Kecerdasan Buatan                | K-Means clustering (scikit-learn), AI text generation (Groq API)          |
-| Pengolahan Citra Digital         | Face recognition/verification (face_recognition + OpenCV)                 |
-| Jaringan Komputer                | Telegram Bot API integration, HTTP REST endpoints                         |
+| Mata Kuliah | Justifikasi |
+|---|---|
+| **Internet of Things** | Integrasi Telegram Bot API sebagai kanal notifikasi real-time saat karyawan melakukan absensi — mensimulasikan komunikasi perangkat-ke-pengguna dalam ekosistem IoT |
+| **Forensik Digital** | Pencatatan login attempt (timestamp, IP, status, metode) ke sheet `Login_Log` dan mekanisme lockout berfungsi sebagai **audit trail** untuk analisis forensik keamanan |
+| **Pengolahan Citra Digital** | Modul `face_auth.py` menggunakan `face_recognition` (128D face encoding) dan fallback **Haar Cascade + histogram correlation** di OpenCV untuk verifikasi identitas berbasis citra wajah |
+| **Big Data** | Google Sheets sebagai data store terdistribusi, caching TTL untuk efisiensi query, serta pengolahan batch data kehadiran dengan Pandas (filtering, grouping, aggregation) |
+| **Penambangan Data** | Implementasi **K-Means Clustering** dengan `StandardScaler` normalisasi untuk mengelompokkan pola kehadiran karyawan menjadi 3 kluster (Konsisten, Sering Izin, Tidak Konsisten) |
 
 ## Struktur Folder
 
