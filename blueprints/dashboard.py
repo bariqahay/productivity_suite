@@ -4,6 +4,7 @@ Menyediakan analytics kehadiran dengan Chart.js (bar, donut, line),
 rekap per karyawan, K-Means clustering, dan export Excel.
 """
 
+from httpx._transports import default
 import io
 import os
 import logging
@@ -14,6 +15,7 @@ import pandas as pd
 from flask import Blueprint, render_template, request, jsonify, send_file
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from dateutil import parser as dateparser
 
 from utils.sheets import get_all_records
 
@@ -41,15 +43,9 @@ def index():
 
 @dashboard_bp.route("/api/data")
 def api_data():
-    """
-    API endpoint utama dashboard.
-    Mengembalikan semua data yang diperlukan oleh chart dan tabel.
-    Query param: period = week | month | all
-    """
     try:
         period = request.args.get("period", "all")
 
-        # Ambil semua record kehadiran
         all_records = get_all_records("Absensi")
 
         if not all_records:
@@ -60,13 +56,9 @@ def api_data():
                 "rekap": [],
             })
 
-        # Konversi ke DataFrame
         df = pd.DataFrame(all_records)
 
-        # Parse timestamp menjadi datetime
         df["Timestamp"] = pd.to_datetime(df["Timestamp"], format="mixed", errors="coerce")
-
-        # Hapus baris dengan timestamp invalid
         df = df.dropna(subset=["Timestamp"])
 
         if df.empty:
@@ -80,15 +72,12 @@ def api_data():
         # Filter berdasarkan periode
         now = datetime.now()
         if period == "week":
-            # Minggu ini (Senin - Minggu)
             start_of_week = now - timedelta(days=now.weekday())
             start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
             df = df[df["Timestamp"] >= start_of_week]
         elif period == "month":
-            # Bulan ini
             start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
             df = df[df["Timestamp"] >= start_of_month]
-        # 'all' = tidak ada filter
 
         if df.empty:
             return jsonify({
@@ -98,41 +87,61 @@ def api_data():
                 "rekap": [],
             })
 
-        # === 1. Kehadiran Harian (bar chart) ===
-        df["Tanggal"] = df["Timestamp"].dt.strftime("%d %b")
-        daily_counts = df.groupby("Tanggal").size()
-        # Urutkan berdasarkan tanggal asli
-        df_sorted = df.sort_values("Timestamp")
-        ordered_dates = df_sorted["Tanggal"].unique()
+        # === 1. Kehadiran Harian — hanya Hadir + WFH ===
+        df_hadir = df[df["Status"].isin(["Hadir", "WFH"])].copy()
+        df_hadir = df_hadir.sort_values("Timestamp")
+        df_hadir["Tanggal"] = df_hadir["Timestamp"].dt.strftime("%d %b")
+
+        daily_counts = df_hadir.groupby("Tanggal").size()
+        ordered_dates = list(dict.fromkeys(df_hadir["Tanggal"]))
         daily = {date: int(daily_counts.get(date, 0)) for date in ordered_dates}
 
         # === 2. Distribusi Status (donut chart) ===
         status_dist = df["Status"].value_counts().to_dict()
         status_distribution = {k: int(v) for k, v in status_dist.items()}
 
-        # === 3. Tren Mingguan (line chart) ===
-        df["Minggu"] = df["Timestamp"].dt.isocalendar().week.astype(str)
-        df["Tahun"] = df["Timestamp"].dt.year.astype(str)
-        df["MingguLabel"] = "W" + df["Minggu"]
-        weekly_counts = df.groupby(["Tahun", "MingguLabel"]).size()
+        # === 3. Tren Mingguan — hanya Hadir + WFH ===
+        iso_cal = df_hadir["Timestamp"].dt.isocalendar()
+        df_hadir["ISOYear"] = iso_cal.year.astype(str)
+        df_hadir["Minggu"] = iso_cal.week.astype(str).str.zfill(2)
+        df_hadir["MingguLabel"] = "W" + df_hadir["Minggu"]
+
+        weekly_counts = df_hadir.groupby(["ISOYear", "MingguLabel"]).size()
+
+        # Sort by ISO year + week biar line chart urutannya bener
         weekly_trend = {}
-        for (tahun, minggu), count in weekly_counts.items():
-            label = f"{minggu}"
-            weekly_trend[label] = int(count)
+        for (iso_year, minggu_label), count in sorted(weekly_counts.items()):
+            key = f"{iso_year}-{minggu_label}"
+            weekly_trend[key] = int(count)
 
         # === 4. Rekap Per Karyawan + K-Means Clustering ===
         rekap = _build_rekap_with_clustering(df)
+
+        # === 5. Present Count (rasio Hadir+WFH / total record dalam periode) ===
+        karyawan_records = get_all_records("Karyawan")
+        total_karyawan = len(karyawan_records)
+
+        total_record = len(df)
+        hadir_count = len(df[df["Status"].isin(["Hadir", "WFH"])])
+        percent = round((hadir_count / total_record) * 100) if total_record > 0 else 0
 
         return jsonify({
             "daily": daily,
             "status_distribution": status_distribution,
             "weekly_trend": weekly_trend,
             "rekap": rekap,
+            "present_count": {
+                "percent": percent,
+                "hadir_count": hadir_count,
+                "total_record": total_record,
+                "total_karyawan": total_karyawan,
+            },
         })
 
     except Exception as e:
         logger.error(f"[ERROR] dashboard - Gagal memuat data dashboard: {e}")
         return jsonify({"error": "Gagal memuat data dashboard"}), 500
+
 
 
 def _build_rekap_with_clustering(df):
@@ -266,15 +275,11 @@ def _simple_label(row):
 
 @dashboard_bp.route("/api/present-count")
 def api_present_count():
-    """
-    API endpoint untuk menghitung persentase kehadiran hari ini.
-    Rate limit: maksimum 1 request per 5 detik per IP.
-    Mengembalikan: { percent, hadir_count, total_karyawan }
-    """
     try:
-        # Rate limiting: 1 request per 5 detik per IP
+        # Rate limiting
         client_ip = request.remote_addr or "unknown"
         now = time.time()
+        today = datetime.now().date()
         last_request = _present_count_rate_limit.get(client_ip, 0)
         if now - last_request < 5:
             return jsonify({
@@ -282,43 +287,43 @@ def api_present_count():
             }), 429
         _present_count_rate_limit[client_ip] = now
 
-        # Bersihkan entry lama (lebih dari 60 detik) agar tidak bocor memori
         expired_ips = [ip for ip, ts in _present_count_rate_limit.items() if now - ts > 60]
         for ip in expired_ips:
             del _present_count_rate_limit[ip]
 
-        # Ambil total karyawan dari tab "Karyawan"
         karyawan_records = get_all_records("Karyawan")
         total_karyawan = len(karyawan_records)
 
         if total_karyawan == 0:
-            return jsonify({
-                "percent": 0,
-                "hadir_count": 0,
-                "total_karyawan": 0,
-            })
+            return jsonify({"percent": 0, "hadir_count": 0, "total_karyawan": 0})
 
-        # Ambil semua record absensi
         absensi_records = get_all_records("Absensi")
-
-        # Filter: Status="Hadir" DAN tanggal=hari ini
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        logger.debug(f"Total absensi records: {len(absensi_records)}")
+        if absensi_records:
+            logger.debug(f"Sample record: {absensi_records[0]}")
+            logger.debug(f"Today: {today}")
+        today = datetime.now().date()
         hadir_count = 0
-        nama_sudah_hadir = set()  # Hindari duplikasi per karyawan
+        nama_sudah_hadir = set()
 
         for record in absensi_records:
-            timestamp = record.get("Timestamp", "")
+            timestamp_raw = record.get("Timestamp", "")
             status = record.get("Status", "")
             nama = record.get("Nama", "")
 
-            # Cek apakah timestamp dimulai dengan tanggal hari ini
-            if (timestamp.startswith(today_str)
-                    and status == "Hadir"
-                    and nama not in nama_sudah_hadir):
+            if not timestamp_raw or status != "Hadir" or nama in nama_sudah_hadir:
+                continue
+
+            try:
+                record_date = dateparser.parse(timestamp_raw).date()
+            except Exception:
+                logger.warning(f"Timestamp tidak bisa di-parse: {timestamp_raw!r}")
+                continue
+
+            if record_date == today:
                 hadir_count += 1
                 nama_sudah_hadir.add(nama)
 
-        # Hitung persentase
         percent = round((hadir_count / total_karyawan) * 100)
 
         return jsonify({

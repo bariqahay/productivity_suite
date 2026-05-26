@@ -171,9 +171,29 @@ async function initDashboard(period) {
         renderStatusDonutChart(data.status_distribution || {});
         renderWeeklyLineChart(data.weekly_trend || {});
         renderRekapTable(data.rekap || []);
+        updatePresentCard(data.present_count, period);  // tambah ini
     } catch (err) {
         console.error('Error loading dashboard:', err);
     }
+}
+
+function updatePresentCard(presentCount, period) {
+    var percentEl = document.getElementById('presentPercent');
+    var detailEl = document.getElementById('presentDetail');
+    if (!percentEl || !detailEl) return;
+
+    if (!presentCount) {
+        percentEl.textContent = '--%';
+        detailEl.textContent = 'Gagal memuat data';
+        return;
+    }
+
+    var labelPeriod = period === 'week' ? 'minggu ini'
+        : period === 'month' ? 'bulan ini'
+            : 'semua waktu';          // tambah ini
+
+    percentEl.textContent = presentCount.percent + '%';
+    detailEl.textContent = presentCount.hadir_count + ' kehadiran dari ' + presentCount.total_record + ' total absensi (' + labelPeriod + ')';
 }
 
 /**

@@ -7,21 +7,11 @@
     <h1 class="display-lg">Dashboard</h1>
     <div class="dashboard-filter-bar">
         <div class="segmented-control" id="periodFilter">
-            <button
-                class="segmented-control__btn segmented-control__btn--active"
-                data-period="week"
-                onclick="changeFilter('week', this)"
-            >Minggu Ini</button>
-            <button
-                class="segmented-control__btn"
-                data-period="month"
-                onclick="changeFilter('month', this)"
-            >Bulan Ini</button>
-            <button
-                class="segmented-control__btn"
-                data-period="all"
-                onclick="changeFilter('all', this)"
-            >Semua</button>
+            <button class="segmented-control__btn segmented-control__btn--active" data-period="week"
+                onclick="changeFilter('week', this)">Minggu Ini</button>
+            <button class="segmented-control__btn" data-period="month" onclick="changeFilter('month', this)">Bulan
+                Ini</button>
+            <button class="segmented-control__btn" data-period="all" onclick="changeFilter('all', this)">Semua</button>
         </div>
     </div>
 </div>
@@ -31,9 +21,10 @@
     <!-- Card 1: Waktu & Tanggal -->
     <div class="info-card" id="infoCardClock">
         <div class="info-card__icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="10"/>
-                <polyline points="12 6 12 12 16 14"/>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10" />
+                <polyline points="12 6 12 12 16 14" />
             </svg>
         </div>
         <div class="info-card__content">
@@ -45,9 +36,10 @@
     <!-- Card 2: Lokasi Kantor -->
     <div class="info-card" id="infoCardLocation">
         <div class="info-card__icon">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
-                <circle cx="12" cy="10" r="3"/>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                stroke-linejoin="round">
+                <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+                <circle cx="12" cy="10" r="3" />
             </svg>
         </div>
         <div class="info-card__content">
@@ -59,11 +51,12 @@
     <!-- Card 3: Kehadiran Hari Ini -->
     <div class="info-card" id="infoCardPresent">
         <div class="info-card__icon info-card__icon--primary">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-                <circle cx="9" cy="7" r="4"/>
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-                <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                stroke-linejoin="round">
+                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                <circle cx="9" cy="7" r="4" />
+                <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
             </svg>
         </div>
         <div class="info-card__content">
@@ -106,9 +99,9 @@
             <h2 class="title-sm">Rekap Per Karyawan</h2>
             <button class="btn btn-secondary" onclick="exportXlsx()" id="exportBtn">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-                    <polyline points="7 10 12 15 17 10"/>
-                    <line x1="12" y1="15" x2="12" y2="3"/>
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                    <polyline points="7 10 12 15 17 10" />
+                    <line x1="12" y1="15" x2="12" y2="3" />
                 </svg>
                 Export .xlsx
             </button>
@@ -137,34 +130,20 @@
 
 {% block scripts %}
 <script>
-    // Inisialisasi dashboard setelah DOM siap
-    document.addEventListener('DOMContentLoaded', function() {
+    document.addEventListener('DOMContentLoaded', function () {
         initDashboard('week');
-
-        // === Jam digital (update setiap detik) ===
         initLiveClock();
-
-        // === Persentase kehadiran hari ini (refresh setiap 60 detik) ===
-        fetchPresentCount();
-        window._presentCountInterval = setInterval(fetchPresentCount, 60000);
     });
 
-    // Bersihkan semua interval saat halaman ditinggalkan (cegah memory leak)
-    window.addEventListener('beforeunload', function() {
+    window.addEventListener('beforeunload', function () {
         if (window._clockInterval) clearInterval(window._clockInterval);
-        if (window._presentCountInterval) clearInterval(window._presentCountInterval);
     });
 
-    /**
-     * Jam digital — update setiap detik dengan format HH:MM:SS
-     * dan tanggal Indonesia (Hari, DD Bulan YYYY).
-     */
     function initLiveClock() {
         var clockEl = document.getElementById('liveClock');
         var dateEl = document.getElementById('liveDate');
         if (!clockEl || !dateEl) return;
 
-        // Nama hari dan bulan dalam Bahasa Indonesia
         var namaHari = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
         var namaBulan = [
             'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
@@ -189,30 +168,21 @@
         window._clockInterval = setInterval(updateClock, 1000);
     }
 
-    /**
-     * Ambil persentase kehadiran hari ini dari API.
-     */
-    async function fetchPresentCount() {
+    function updatePresentCard(presentCount, period) {
         var percentEl = document.getElementById('presentPercent');
         var detailEl = document.getElementById('presentDetail');
         if (!percentEl || !detailEl) return;
 
-        try {
-            var response = await fetch('/dashboard/api/present-count');
-            var data = await response.json();
-
-            if (response.ok) {
-                percentEl.textContent = data.percent + '%';
-                detailEl.textContent = 'dari ' + data.total_karyawan + ' karyawan';
-            } else {
-                percentEl.textContent = '--%';
-                detailEl.textContent = 'Gagal memuat data';
-            }
-        } catch (err) {
-            console.error('Error fetching present count:', err);
+        if (!presentCount) {
             percentEl.textContent = '--%';
             detailEl.textContent = 'Gagal memuat data';
+            return;
         }
+
+        var labelPeriod = period === 'week' ? 'minggu ini' : period === 'month' ? 'bulan ini' : 'semua waktu';
+
+        percentEl.textContent = presentCount.percent + '%';
+        detailEl.textContent = presentCount.hadir_count + ' kehadiran dari ' + presentCount.total_record + ' total absensi (' + labelPeriod + ')';
     }
 </script>
 {% endblock %}
