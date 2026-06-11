@@ -10,8 +10,8 @@ Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisn
 
 | Modul | Tanggung Jawab |
 |---|---|
-| [sheets.py](file:///c:/Users/rifki/Documents/projek_magang/utils/sheets.py) | CRUD Google Sheets + caching |
-| [face_auth.py](file:///c:/Users/rifki/Documents/projek_magang/utils/face_auth.py) | Face encoding, verifikasi wajah |
+| [sheets.py](file:///c:/Users/rifki/Documents/projek_magang/utils/sheets.py) | CRUD Google Sheets + TTL cache + write queue dengan retry |
+| [face_auth.py](file:///c:/Users/rifki/Documents/projek_magang/utils/face_auth.py) | Face encoding, verifikasi wajah, pelaporan metode |
 | [telegram.py](file:///c:/Users/rifki/Documents/projek_magang/utils/telegram.py) | Notifikasi Telegram Bot |
 | [image_gen.py](file:///c:/Users/rifki/Documents/projek_magang/utils/image_gen.py) | Word cloud generation |
 
@@ -22,21 +22,29 @@ Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisn
 ### Absensi
 1. Halaman memuat **daftar karyawan** dari sheet `Karyawan` untuk dropdown
 2. User memilih nama, status (Hadir/Izin/Sakit/WFH), dan catatan
-3. Submit → `append_row()` ke sheet `Absensi` **dan** `Audit_Log`
+3. Submit → `append_row()` ke sheet `Absensi` **dan** `Audit_Log` (non-blocking — dikirim melalui write queue)
 4. Notifikasi dikirim ke **grup Telegram** via Bot API
 5. Tabel audit log (20 record terakhir) di-refresh otomatis via `/api/log`
 
 ### Login + Face Verification
 1. User input username + password → divalidasi terhadap `ADMIN_USERS` di `.env`
+   - Password disimpan sebagai **bcrypt hash** (cost=12); jalankan `migrate_passwords.py` sekali untuk migrasi dari plain-text
+   - Verifikasi menggunakan `bcrypt.checkpw()` — plain-text lama masih diterima dengan peringatan di log
 2. Jika password valid **dan** foto referensi ada → masuk tahap **face verification**
 3. Webcam capture → base64 → `verify_face()` membandingkan encoding dengan `face_recognition` (atau fallback **Haar Cascade + histogram**)
+   - Setiap hasil verifikasi menyertakan field `method`: `face_recognition` atau `opencv_fallback`
+   - Jika fallback aktif, **toast amber** muncul di frontend untuk memberi tahu user
 4. Gagal 3× berturut-turut → akun **lockout** selama `LOCKOUT_MINUTES`
-5. Setiap percobaan (sukses/gagal) dicatat ke sheet `Login_Log`
+   - Status lockout (attempt count, timestamp, locked_until) **dipersist ke sheet `Lockout_State`** — bertahan saat server restart
+   - State dimuat ulang dari sheet pada setiap pengecekan, bukan dari session
+5. Setiap percobaan (sukses/gagal) dicatat ke sheet `Login_Log`; kolom `Method` mencatat metode aktif, mis. `password+face(opencv_fallback)`
 
 ### Dashboard
 1. Data diambil dari sheet `Absensi` → di-filter per periode (week/month/all)
 2. Diolah dengan **Pandas** menjadi: kehadiran harian (bar), distribusi status (donut), tren mingguan (line)
 3. **K-Means Clustering** (`sklearn`) mengelompokkan karyawan menjadi 3 kluster: Konsisten, Sering Izin, Tidak Konsisten
+   - Hasil clustering di-**cache** menggunakan `joblib` (disk) dan dict in-process
+   - Cache key = jumlah baris sheet `Absensi`; hanya di-refit saat ada data baru, tidak setiap request
 4. Visualisasi di-render client-side dengan **Chart.js**
 5. Data bisa di-export ke **Excel (.xlsx)** via `openpyxl`
 
@@ -44,7 +52,9 @@ Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisn
 1. User input topik, keywords, tone (formal/santai), panjang (pendek/sedang/panjang)
 2. Prompt dikirim ke **Groq API** dengan model **LLaMA 3.3 70B**
 3. Hasil artikel di-generate → otomatis dibuat **word cloud** (colormap `Reds`)
-4. Word cloud di-cache per session berdasarkan **MD5 hash** artikel
+4. Word cloud di-cache di **level aplikasi** (bukan per-session) menggunakan **Flask-Caching** (filesystem backend, TTL 1 jam)
+   - Cache key = MD5 hash konten artikel → artikel yang sama menghasilkan gambar yang sama untuk semua user
+   - File PNG lama (>1 jam) dibersihkan otomatis pada setiap request generate
 5. Artikel bisa di-download sebagai **.docx** (via `python-docx`), word cloud sebagai **.png**
 
 ---
@@ -52,19 +62,22 @@ Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisn
 ## 3. Alur Data
 
 ```
-┌──────────┐     HTTP/JSON     ┌──────────────────────┐
-│          │ ───────────────▶  │   Flask App          │
-│  Browser │                   │  ┌────────────────┐  │
-│  (User)  │                   │  │  Blueprints     │  │
-│          │  ◀───────────────  │  │  auth │ absensi│  │
-└──────────┘     HTML/JSON     │  │  dash │ artikel│  │
-                               │  └───────┬────────┘  │
-                               │          │           │
-                               │  ┌───────▼────────┐  │
-                               │  │  utils/         │  │
-                               │  │  service layer  │  │
-                               │  └──┬──┬──┬──┬────┘  │
-                               └─────┼──┼──┼──┼───────┘
+┌──────────┐     HTTP/JSON     ┌──────────────────────────────────────┐
+│          │ ───────────────▶  │   Flask App (create_app)             │
+│  Browser │                   │  ┌──────────────────────────────┐   │
+│  (User)  │                   │  │  Blueprints                   │   │
+│          │  ◀───────────────  │  │  auth │ absensi │ dash │ art │   │
+└──────────┘     HTML/JSON     │  └──────────────┬───────────────┘   │
+                               │                 │                    │
+                               │  ┌──────────────▼───────────────┐   │
+                               │  │  utils / service layer        │   │
+                               │  │  sheets.py ──► write queue    │   │
+                               │  │               (threading)     │   │
+                               │  └──┬──┬──┬──┬──────────────────┘   │
+                               │     │  │  │  │                       │
+                               │  Flask-Caching (filesystem)          │
+                               │  joblib disk cache (K-Means)         │
+                               └─────┼──┼──┼──┼───────────────────────┘
                                      │  │  │  │
                     ┌────────────────┘  │  │  └──────────────────┐
                     ▼                   ▼  ▼                     ▼
@@ -76,8 +89,12 @@ Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisn
             │ • Absensi    │
             │ • Audit_Log  │
             │ • Login_Log  │
+            │ • Lockout_State │
             └──────────────┘
 ```
+
+### Write Queue (sheets.py)
+Semua `append_row()` kini **non-blocking**: row dimasukkan ke `threading.Queue`, lalu daemon thread `sheets-write-worker` mengirim ke Sheets API secara background. Jika terkena rate limit (HTTP 429), worker melakukan **exponential backoff** (2 s → 4 → 8 → … → 64 s, maks 6 percobaan) sebelum menyerah.
 
 ---
 
@@ -86,10 +103,10 @@ Folder `utils/` bertindak sebagai **service layer** yang mengisolasi logika bisn
 | Mata Kuliah | Justifikasi |
 |---|---|
 | **Internet of Things** | Integrasi Telegram Bot API sebagai kanal notifikasi real-time saat karyawan melakukan absensi — mensimulasikan komunikasi perangkat-ke-pengguna dalam ekosistem IoT |
-| **Forensik Digital** | Pencatatan login attempt (timestamp, IP, status, metode) ke sheet `Login_Log` dan mekanisme lockout berfungsi sebagai **audit trail** untuk analisis forensik keamanan |
-| **Pengolahan Citra Digital** | Modul `face_auth.py` menggunakan `face_recognition` (128D face encoding) dan fallback **Haar Cascade + histogram correlation** di OpenCV untuk verifikasi identitas berbasis citra wajah |
-| **Big Data** | Google Sheets sebagai data store terdistribusi, caching TTL untuk efisiensi query, serta pengolahan batch data kehadiran dengan Pandas (filtering, grouping, aggregation) |
-| **Penambangan Data** | Implementasi **K-Means Clustering** dengan `StandardScaler` normalisasi untuk mengelompokkan pola kehadiran karyawan menjadi 3 kluster (Konsisten, Sering Izin, Tidak Konsisten) |
+| **Forensik Digital** | Pencatatan login attempt (timestamp, IP, status, metode) ke sheet `Login_Log` dan mekanisme lockout berfungsi sebagai **audit trail** untuk analisis forensik keamanan. Kolom `Method` mencatat metode verifikasi wajah aktif (`face_recognition` atau `opencv_fallback`). Status lockout dipersist ke sheet `Lockout_State` sehingga rekam jejak tidak hilang saat server restart |
+| **Pengolahan Citra Digital** | Modul `face_auth.py` menggunakan `face_recognition` (128D face encoding) dan fallback **Haar Cascade + histogram correlation** di OpenCV untuk verifikasi identitas berbasis citra wajah. Setiap hasil verifikasi menyertakan field `method` sehingga metode yang digunakan dapat dilacak dan ditampilkan ke user sebagai toast peringatan |
+| **Big Data** | Google Sheets sebagai data store terdistribusi, caching TTL untuk efisiensi query, write queue non-blocking dengan retry untuk keandalan, serta pengolahan batch data kehadiran dengan Pandas (filtering, grouping, aggregation) |
+| **Penambangan Data** | Implementasi **K-Means Clustering** dengan `StandardScaler` normalisasi untuk mengelompokkan pola kehadiran karyawan menjadi 3 kluster (Konsisten, Sering Izin, Tidak Konsisten). Model tidak di-refit setiap request — hasil di-cache dengan `joblib` dan hanya diperbarui saat jumlah baris dataset berubah |
 
 ---
 

@@ -4,18 +4,20 @@ Menghasilkan artikel menggunakan Groq API (LLaMA 3.3 70B),
 auto-generate word cloud, dan export ke .docx / .png.
 """
 
-import os
+import base64
+import glob
+import hashlib
 import io
 import logging
-import base64
-import hashlib
+import os
+import time
 from datetime import datetime
 
-from flask import Blueprint, render_template, request, jsonify, send_file, session
-from groq import Groq, APIStatusError
 from docx import Document
-from docx.shared import Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.shared import Pt
+from flask import Blueprint, jsonify, render_template, request, send_file, session
+from groq import APIStatusError, Groq
 
 from utils.image_gen import generate_wordcloud
 
@@ -27,6 +29,40 @@ artikel_bp = Blueprint(
     __name__,
     url_prefix="/artikel",
 )
+
+# Word cloud cache TTL — must match app.config["CACHE_DEFAULT_TIMEOUT"]
+_WC_CACHE_TTL = 3600  # 1 hour
+
+
+def _get_cache():
+    """Lazy import of the app-level cache to avoid circular imports."""
+    from app import cache  # noqa: PLC0415
+
+    return cache
+
+
+def _cleanup_old_wordclouds(
+    cache_dir: str, max_age_seconds: int = _WC_CACHE_TTL
+) -> None:
+    """
+    Remove .png files in cache_dir that are older than max_age_seconds.
+    Called on every generate request to prevent disk pile-up.
+    """
+    now = time.time()
+    pattern = os.path.join(cache_dir, "wc_*.png")
+    removed = 0
+    for fpath in glob.glob(pattern):
+        try:
+            if now - os.path.getmtime(fpath) > max_age_seconds:
+                os.remove(fpath)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        logger.info(
+            f"[wordcloud] Cleaned up {removed} expired PNG file(s) from {cache_dir}"
+        )
+
 
 # Inisialisasi Groq client
 _groq_client = None
@@ -68,7 +104,9 @@ def generate():
 
         # Validasi topik
         if not topik:
-            return jsonify({"success": False, "message": "Topik artikel wajib diisi"}), 400
+            return jsonify(
+                {"success": False, "message": "Topik artikel wajib diisi"}
+            ), 400
 
         # Mapping panjang ke jumlah kata
         panjang_map = {
@@ -79,13 +117,17 @@ def generate():
         jumlah_kata = panjang_map.get(panjang, "600-900")
 
         # Tentukan tone
-        tone_desc = "formal dan profesional" if tone == "formal" else "santai dan conversational"
+        tone_desc = (
+            "formal dan profesional"
+            if tone == "formal"
+            else "santai dan conversational"
+        )
 
         # Konstruksi prompt untuk LLM
         prompt = f"""Buatkan artikel dalam Bahasa Indonesia dengan spesifikasi berikut:
 
 Topik: {topik}
-{'Keywords: ' + keywords if keywords else ''}
+{"Keywords: " + keywords if keywords else ""}
 Tone: {tone_desc}
 Panjang: {jumlah_kata} kata
 
@@ -94,7 +136,7 @@ Instruksi:
 2. Gunakan subjudul (heading) untuk setiap bagian
 3. Mulai dengan paragraf pembuka yang menarik
 4. Akhiri dengan kesimpulan yang kuat
-5. {'Sertakan keyword berikut secara natural: ' + keywords if keywords else 'Buat konten yang relevan dan informatif'}
+5. {"Sertakan keyword berikut secara natural: " + keywords if keywords else "Buat konten yang relevan dan informatif"}
 6. Jangan gunakan format markdown (seperti ** atau ##), gunakan plain text dengan huruf kapital untuk subjudul
 7. Pastikan tone penulisan {tone_desc}
 
@@ -124,66 +166,90 @@ Tulis artikelnya langsung tanpa tambahan penjelasan."""
         # Ambil teks hasil generate
         article_text = response.choices[0].message.content
         if not article_text:
-            return jsonify({"success": False, "message": "API tidak mengembalikan hasil"}), 500
+            return jsonify(
+                {"success": False, "message": "API tidak mengembalikan hasil"}
+            ), 500
 
         article_text = article_text.strip()
 
-        # Generate word cloud — skip jika teks artikel tidak berubah
+        # Generate word cloud — keyed by MD5 of article content (app-level cache)
         article_hash = hashlib.md5(article_text.encode()).hexdigest()
-        prev_hash = session.get("article_hash", "")
+        cache_key = f"wordcloud_{article_hash}"
+        app_cache = _get_cache()
 
-        if article_hash != prev_hash or not session.get("wordcloud_b64"):
+        # Run cleanup of stale PNGs on each generate request
+        from flask import current_app
+
+        wc_cache_dir = current_app.config.get("CACHE_DIR", "")
+        if wc_cache_dir:
+            _cleanup_old_wordclouds(wc_cache_dir)
+
+        wordcloud_b64 = app_cache.get(cache_key)
+        if wordcloud_b64 is None:
             wordcloud_b64 = generate_wordcloud(article_text)
-            session["wordcloud_b64"] = wordcloud_b64
-            session["article_hash"] = article_hash
+            if wordcloud_b64:
+                app_cache.set(cache_key, wordcloud_b64, timeout=_WC_CACHE_TTL)
+            logger.info(f"Word cloud generated and cached (key={cache_key[:12]}...)")
         else:
-            wordcloud_b64 = session.get("wordcloud_b64")
-            logger.info("Word cloud di-cache — teks artikel tidak berubah")
+            logger.info(f"Word cloud cache hit (key={cache_key[:12]}...)")
 
         # Simpan ke session untuk download nanti
+        session["wordcloud_b64"] = wordcloud_b64
         session["article_text"] = article_text
         session["article_topik"] = topik
         session["article_keywords"] = keywords
 
         # URL word cloud untuk ditampilkan di frontend
-        wordcloud_url = f"data:image/png;base64,{wordcloud_b64}" if wordcloud_b64 else None
+        wordcloud_url = (
+            f"data:image/png;base64,{wordcloud_b64}" if wordcloud_b64 else None
+        )
 
         logger.info(f"Artikel berhasil di-generate: {topik}")
 
-        return jsonify({
-            "success": True,
-            "article_text": article_text,
-            "wordcloud_url": wordcloud_url,
-        })
+        return jsonify(
+            {
+                "success": True,
+                "article_text": article_text,
+                "wordcloud_url": wordcloud_url,
+            }
+        )
 
     except APIStatusError as e:
         # Tangani rate limit (429) secara spesifik
         if e.status_code == 429:
             logger.warning(f"[ERROR] artikel - Groq rate limit tercapai: {e}")
-            return jsonify({
-                "success": False,
-                "message": "Rate limit tercapai, coba beberapa saat lagi.",
-            }), 429
+            return jsonify(
+                {
+                    "success": False,
+                    "message": "Rate limit tercapai, coba beberapa saat lagi.",
+                }
+            ), 429
         logger.error(f"[ERROR] artikel - Groq API error: {e}")
-        return jsonify({
-            "success": False,
-            "message": "Terjadi kesalahan saat menghubungi API. Coba lagi nanti."
-        }), 500
+        return jsonify(
+            {
+                "success": False,
+                "message": "Terjadi kesalahan saat menghubungi API. Coba lagi nanti.",
+            }
+        ), 500
 
     except ValueError as e:
         # API key belum dikonfigurasi
         logger.error(f"[ERROR] artikel - Konfigurasi error: {e}")
-        return jsonify({
-            "success": False,
-            "message": "Konfigurasi API belum lengkap. Hubungi administrator."
-        }), 500
+        return jsonify(
+            {
+                "success": False,
+                "message": "Konfigurasi API belum lengkap. Hubungi administrator.",
+            }
+        ), 500
 
     except Exception as e:
         logger.error(f"[ERROR] artikel - Error generate artikel: {e}")
-        return jsonify({
-            "success": False,
-            "message": "Terjadi kesalahan server saat generate artikel"
-        }), 500
+        return jsonify(
+            {
+                "success": False,
+                "message": "Terjadi kesalahan server saat generate artikel",
+            }
+        ), 500
 
 
 @artikel_bp.route("/download/docx")
@@ -196,7 +262,11 @@ def download_docx():
         topik = session.get("article_topik", "Artikel")
 
         if not article_text:
-            return jsonify({"error": "Tidak ada artikel untuk di-download. Generate terlebih dahulu."}), 404
+            return jsonify(
+                {
+                    "error": "Tidak ada artikel untuk di-download. Generate terlebih dahulu."
+                }
+            ), 404
 
         # Buat dokumen Word
         doc = Document()
@@ -275,7 +345,11 @@ def download_wordcloud():
         wordcloud_b64 = session.get("wordcloud_b64")
 
         if not wordcloud_b64:
-            return jsonify({"error": "Tidak ada word cloud untuk di-download. Generate terlebih dahulu."}), 404
+            return jsonify(
+                {
+                    "error": "Tidak ada word cloud untuk di-download. Generate terlebih dahulu."
+                }
+            ), 404
 
         # Decode base64 ke bytes
         wordcloud_bytes = base64.b64decode(wordcloud_b64)

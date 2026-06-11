@@ -4,18 +4,19 @@ Menyediakan analytics kehadiran dengan Chart.js (bar, donut, line),
 rekap per karyawan, K-Means clustering, dan export Excel.
 """
 
-from httpx._transports import default
 import io
-import os
 import logging
+import os
+import tempfile
 import time
 from datetime import datetime, timedelta
 
+import joblib
 import pandas as pd
-from flask import Blueprint, render_template, request, jsonify, send_file
+from dateutil import parser as dateparser
+from flask import Blueprint, jsonify, render_template, request, send_file
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
-from dateutil import parser as dateparser
 
 from utils.sheets import get_all_records
 
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 # Rate limiting sederhana untuk /api/present-count
 # Format: {ip: timestamp_terakhir_request}
 _present_count_rate_limit = {}
+
+# === K-Means cluster cache ===
+# Stores (row_count, clustering_result_list) so the model is only
+# re-fitted when the Absensi sheet grows (new rows added).
+_KMEANS_CACHE_PATH = os.path.join(tempfile.gettempdir(), "kmeans_cluster_cache.joblib")
+_kmeans_cache: dict = {}  # In-process fast path: {row_count: result_list}
 
 # Definisi blueprint
 dashboard_bp = Blueprint(
@@ -49,43 +56,55 @@ def api_data():
         all_records = get_all_records("Absensi")
 
         if not all_records:
-            return jsonify({
-                "daily": {},
-                "status_distribution": {},
-                "weekly_trend": {},
-                "rekap": [],
-            })
+            return jsonify(
+                {
+                    "daily": {},
+                    "status_distribution": {},
+                    "weekly_trend": {},
+                    "rekap": [],
+                }
+            )
 
         df = pd.DataFrame(all_records)
 
-        df["Timestamp"] = pd.to_datetime(df["Timestamp"], format="mixed", errors="coerce")
+        df["Timestamp"] = pd.to_datetime(
+            df["Timestamp"], format="mixed", errors="coerce"
+        )
         df = df.dropna(subset=["Timestamp"])
 
         if df.empty:
-            return jsonify({
-                "daily": {},
-                "status_distribution": {},
-                "weekly_trend": {},
-                "rekap": [],
-            })
+            return jsonify(
+                {
+                    "daily": {},
+                    "status_distribution": {},
+                    "weekly_trend": {},
+                    "rekap": [],
+                }
+            )
 
         # Filter berdasarkan periode
         now = datetime.now()
         if period == "week":
             start_of_week = now - timedelta(days=now.weekday())
-            start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+            start_of_week = start_of_week.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
             df = df[df["Timestamp"] >= start_of_week]
         elif period == "month":
-            start_of_month = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            start_of_month = now.replace(
+                day=1, hour=0, minute=0, second=0, microsecond=0
+            )
             df = df[df["Timestamp"] >= start_of_month]
 
         if df.empty:
-            return jsonify({
-                "daily": {},
-                "status_distribution": {},
-                "weekly_trend": {},
-                "rekap": [],
-            })
+            return jsonify(
+                {
+                    "daily": {},
+                    "status_distribution": {},
+                    "weekly_trend": {},
+                    "rekap": [],
+                }
+            )
 
         # === 1. Kehadiran Harian — hanya Hadir + WFH ===
         df_hadir = df[df["Status"].isin(["Hadir", "WFH"])].copy()
@@ -125,99 +144,134 @@ def api_data():
         hadir_count = len(df[df["Status"].isin(["Hadir", "WFH"])])
         percent = round((hadir_count / total_record) * 100) if total_record > 0 else 0
 
-        return jsonify({
-            "daily": daily,
-            "status_distribution": status_distribution,
-            "weekly_trend": weekly_trend,
-            "rekap": rekap,
-            "present_count": {
-                "percent": percent,
-                "hadir_count": hadir_count,
-                "total_record": total_record,
-                "total_karyawan": total_karyawan,
-            },
-        })
+        return jsonify(
+            {
+                "daily": daily,
+                "status_distribution": status_distribution,
+                "weekly_trend": weekly_trend,
+                "rekap": rekap,
+                "present_count": {
+                    "percent": percent,
+                    "hadir_count": hadir_count,
+                    "total_record": total_record,
+                    "total_karyawan": total_karyawan,
+                },
+            }
+        )
 
     except Exception as e:
         logger.error(f"[ERROR] dashboard - Gagal memuat data dashboard: {e}")
         return jsonify({"error": "Gagal memuat data dashboard"}), 500
 
 
+def _run_kmeans(rekap_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fit K-Means on rekap_df and return df with 'kluster' column added.
+    Pure function — no side effects, suitable for caching.
+    """
+    if len(rekap_df) >= 3:
+        features = rekap_df[["total_hadir", "izin", "sakit"]].values
+        scaler = StandardScaler()
+        features_scaled = scaler.fit_transform(features)
+        n_clusters = min(3, len(rekap_df))
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        rekap_df = rekap_df.copy()
+        rekap_df["cluster"] = kmeans.fit_predict(features_scaled)
+        cluster_labels = _map_cluster_labels(rekap_df, kmeans)
+        rekap_df["kluster"] = rekap_df["cluster"].map(cluster_labels)
+    else:
+        rekap_df = rekap_df.copy()
+        rekap_df["kluster"] = rekap_df.apply(_simple_label, axis=1)
+    return rekap_df
+
 
 def _build_rekap_with_clustering(df):
     """
     Membuat rekap per karyawan dan menjalankan K-Means clustering.
-    Kluster: Konsisten, Sering Izin, Tidak Konsisten.
+    Result is cached by row count using joblib + in-process dict.
+    Cache is invalidated when the Absensi row count changes.
     """
-    try:
-        # Agregasi per karyawan
-        rekap_data = []
-        grouped = df.groupby("Nama")
+    global _kmeans_cache
 
-        for nama, group in grouped:
-            total = len(group)
-            hadir = len(group[group["Status"].isin(["Hadir", "WFH"])])
-            izin = len(group[group["Status"] == "Izin"])
-            sakit = len(group[group["Status"] == "Sakit"])
+    # Agregasi per karyawan
+    rekap_data = []
+    grouped = df.groupby("Nama")
 
-            rekap_data.append({
+    for nama, group in grouped:
+        total = len(group)
+        hadir = len(group[group["Status"].isin(["Hadir", "WFH"])])
+        izin = len(group[group["Status"] == "Izin"])
+        sakit = len(group[group["Status"] == "Sakit"])
+        rekap_data.append(
+            {
                 "nama": nama,
                 "total_hadir": hadir,
                 "izin": izin,
                 "sakit": sakit,
                 "total": total,
-            })
+            }
+        )
 
-        if not rekap_data:
-            return []
+    if not rekap_data:
+        return []
 
+    row_count = len(df)
+
+    # 1. Fast in-process cache check
+    if row_count in _kmeans_cache:
+        logger.info(f"[kmeans] In-process cache hit (row_count={row_count})")
+        return _kmeans_cache[row_count]
+
+    # 2. Disk cache (survives worker restarts under gunicorn)
+    try:
+        cached = joblib.load(_KMEANS_CACHE_PATH)
+        if isinstance(cached, dict) and cached.get("row_count") == row_count:
+            logger.info(f"[kmeans] Disk cache hit (row_count={row_count})")
+            result = cached["result"]
+            _kmeans_cache = {row_count: result}  # warm in-process cache
+            return result
+    except Exception:
+        pass  # cache missing or corrupt — recompute
+
+    # 3. Refit
+    logger.info(f"[kmeans] Cache miss — fitting K-Means (row_count={row_count})")
+    try:
         rekap_df = pd.DataFrame(rekap_data)
+        rekap_df = _run_kmeans(rekap_df)
 
-        # K-Means clustering (hanya jika ada cukup data)
-        if len(rekap_df) >= 3:
-            features = rekap_df[["total_hadir", "izin", "sakit"]].values
-
-            # Normalisasi fitur
-            scaler = StandardScaler()
-            features_scaled = scaler.fit_transform(features)
-
-            # Jalankan K-Means dengan 3 kluster
-            n_clusters = min(3, len(rekap_df))
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            rekap_df["cluster"] = kmeans.fit_predict(features_scaled)
-
-            # Mapping kluster berdasarkan rasio kehadiran
-            cluster_labels = _map_cluster_labels(rekap_df, kmeans)
-            rekap_df["kluster"] = rekap_df["cluster"].map(cluster_labels)
-        elif len(rekap_df) > 0:
-            # Jika data kurang dari 3, assign berdasarkan rasio sederhana
-            rekap_df["kluster"] = rekap_df.apply(
-                lambda row: _simple_label(row), axis=1
-            )
-
-        # Konversi ke list of dict
-        result = []
-        for _, row in rekap_df.iterrows():
-            result.append({
+        result = [
+            {
                 "nama": row["nama"],
                 "total_hadir": int(row["total_hadir"]),
                 "izin": int(row["izin"]),
                 "sakit": int(row["sakit"]),
                 "kluster": row.get("kluster", "-"),
-            })
+            }
+            for _, row in rekap_df.iterrows()
+        ]
 
+        # Persist to disk
+        try:
+            joblib.dump({"row_count": row_count, "result": result}, _KMEANS_CACHE_PATH)
+            logger.info(f"[kmeans] Cache saved to {_KMEANS_CACHE_PATH}")
+        except Exception as e:
+            logger.warning(f"[kmeans] Could not save disk cache: {e}")
+
+        _kmeans_cache = {row_count: result}
         return result
 
     except Exception as e:
         logger.error(f"Error saat clustering: {e}")
-        # Fallback: return rekap tanpa kluster
-        return [{
-            "nama": r["nama"],
-            "total_hadir": r["total_hadir"],
-            "izin": r["izin"],
-            "sakit": r["sakit"],
-            "kluster": "-",
-        } for r in rekap_data]
+        return [
+            {
+                "nama": r["nama"],
+                "total_hadir": r["total_hadir"],
+                "izin": r["izin"],
+                "sakit": r["sakit"],
+                "kluster": "-",
+            }
+            for r in rekap_data
+        ]
 
 
 def _map_cluster_labels(rekap_df, kmeans):
@@ -235,16 +289,22 @@ def _map_cluster_labels(rekap_df, kmeans):
     for i in range(len(centers)):
         cluster_data = rekap_df[rekap_df["cluster"] == i]
         if not cluster_data.empty:
-            avg_hadir_ratio = cluster_data["total_hadir"].sum() / max(cluster_data["total"].sum(), 1)
-            avg_izin_ratio = cluster_data["izin"].sum() / max(cluster_data["total"].sum(), 1)
+            avg_hadir_ratio = cluster_data["total_hadir"].sum() / max(
+                cluster_data["total"].sum(), 1
+            )
+            avg_izin_ratio = cluster_data["izin"].sum() / max(
+                cluster_data["total"].sum(), 1
+            )
         else:
             avg_hadir_ratio = 0
             avg_izin_ratio = 0
-        cluster_stats.append({
-            "cluster": i,
-            "hadir_ratio": avg_hadir_ratio,
-            "izin_ratio": avg_izin_ratio,
-        })
+        cluster_stats.append(
+            {
+                "cluster": i,
+                "hadir_ratio": avg_hadir_ratio,
+                "izin_ratio": avg_izin_ratio,
+            }
+        )
 
     # Urutkan berdasarkan rasio kehadiran (tertinggi = Konsisten)
     cluster_stats.sort(key=lambda x: x["hadir_ratio"], reverse=True)
@@ -282,12 +342,14 @@ def api_present_count():
         today = datetime.now().date()
         last_request = _present_count_rate_limit.get(client_ip, 0)
         if now - last_request < 5:
-            return jsonify({
-                "error": "Terlalu banyak request. Coba lagi beberapa detik."
-            }), 429
+            return jsonify(
+                {"error": "Terlalu banyak request. Coba lagi beberapa detik."}
+            ), 429
         _present_count_rate_limit[client_ip] = now
 
-        expired_ips = [ip for ip, ts in _present_count_rate_limit.items() if now - ts > 60]
+        expired_ips = [
+            ip for ip, ts in _present_count_rate_limit.items() if now - ts > 60
+        ]
         for ip in expired_ips:
             del _present_count_rate_limit[ip]
 
@@ -326,11 +388,13 @@ def api_present_count():
 
         percent = round((hadir_count / total_karyawan) * 100)
 
-        return jsonify({
-            "percent": percent,
-            "hadir_count": hadir_count,
-            "total_karyawan": total_karyawan,
-        })
+        return jsonify(
+            {
+                "percent": percent,
+                "hadir_count": hadir_count,
+                "total_karyawan": total_karyawan,
+            }
+        )
 
     except Exception as e:
         logger.error(f"[ERROR] dashboard - Gagal menghitung kehadiran hari ini: {e}")

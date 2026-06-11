@@ -1,10 +1,18 @@
 """
 Modul helper untuk integrasi Google Sheets.
 Menyediakan fungsi CRUD ke spreadsheet via gspread.
+
+Writes are always non-blocking: append_row() enqueues the work and returns
+immediately. A background daemon thread drains the queue and retries on
+HTTP 429 (quota exceeded) with exponential back-off.
+
+Call start_write_worker() once inside create_app() to start the worker.
 """
 
-import os
 import logging
+import os
+import queue
+import threading
 import time
 
 import gspread
@@ -16,6 +24,12 @@ logger = logging.getLogger(__name__)
 # Format: {sheet_name: (timestamp, data)}
 _cache = {}
 _CACHE_TTL = 60  # Detik — jangan fetch ulang jika data masih segar
+
+# === Write queue ===
+# Each item: (sheet_name, row_data)
+_write_queue: queue.Queue = queue.Queue()
+_WORKER_STARTED = False
+_WORKER_LOCK = threading.Lock()
 
 # Scope yang diperlukan untuk Google Sheets API
 SCOPES = [
@@ -68,28 +82,88 @@ def get_sheet(sheet_name):
         raise
 
 
+def _do_append_row(sheet_name, data, attempt=1, max_attempts=6):
+    """
+    Internal: perform the actual Sheets API write.
+    Retries up to max_attempts times with exponential back-off on 429.
+    """
+    delay = 2  # Initial back-off seconds
+    for attempt in range(1, max_attempts + 1):
+        try:
+            worksheet = get_sheet(sheet_name)
+            worksheet.append_row(data, value_input_option="USER_ENTERED")
+            logger.info(f"[queue] Baris ditambahkan ke '{sheet_name}': {data}")
+
+            # Invalidate cache
+            if sheet_name in _cache:
+                del _cache[sheet_name]
+                logger.debug(f"Cache '{sheet_name}' di-invalidate setelah append")
+            return  # success
+
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, "status_code", None)
+            if status == 429 and attempt < max_attempts:
+                logger.warning(
+                    f"[queue] Rate-limited (429) saat menulis ke '{sheet_name}'. "
+                    f"Retry {attempt}/{max_attempts} dalam {delay}s..."
+                )
+                time.sleep(delay)
+                delay = min(delay * 2, 64)  # cap at 64 s
+            else:
+                logger.error(
+                    f"[queue] Gagal menulis ke '{sheet_name}' setelah "
+                    f"{attempt} percobaan: {e}"
+                )
+                return
+        except Exception as e:
+            logger.error(
+                f"[queue] Error tidak terduga saat menulis ke '{sheet_name}': {e}"
+            )
+            return
+
+
+def _write_worker():
+    """Background thread that drains _write_queue and persists each row."""
+    logger.info("[queue] Write worker started")
+    while True:
+        try:
+            sheet_name, data = _write_queue.get(block=True, timeout=5)
+            _do_append_row(sheet_name, data)
+            _write_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            logger.error(f"[queue] Worker unexpected error: {e}")
+
+
+def start_write_worker():
+    """
+    Start the singleton background write worker thread.
+    Must be called once inside create_app() (within app context).
+    """
+    global _WORKER_STARTED
+    with _WORKER_LOCK:
+        if _WORKER_STARTED:
+            return
+        t = threading.Thread(
+            target=_write_worker, daemon=True, name="sheets-write-worker"
+        )
+        t.start()
+        _WORKER_STARTED = True
+        logger.info("[queue] Sheets write worker thread started")
+
+
 def append_row(sheet_name, data):
     """
-    Menambahkan satu baris data ke worksheet.
+    Enqueue a row to be appended to a worksheet (non-blocking).
+    The background worker handles the actual API call with retry.
+
     Args:
         sheet_name: Nama worksheet target.
         data: List berisi nilai-nilai kolom (urut).
-    Returns: dict hasil operasi dari gspread.
     """
-    try:
-        worksheet = get_sheet(sheet_name)
-        result = worksheet.append_row(data, value_input_option="USER_ENTERED")
-        logger.info(f"Baris berhasil ditambahkan ke '{sheet_name}': {data}")
-
-        # Invalidate cache untuk sheet yang baru ditambah data
-        if sheet_name in _cache:
-            del _cache[sheet_name]
-            logger.info(f"Cache untuk '{sheet_name}' di-invalidate setelah append")
-
-        return result
-    except Exception as e:
-        logger.error(f"Gagal menambahkan baris ke '{sheet_name}': {e}")
-        raise
+    _write_queue.put((sheet_name, data))
+    logger.debug(f"[queue] Enqueued row untuk '{sheet_name}': {data}")
 
 
 def get_all_records(sheet_name):
@@ -115,7 +189,9 @@ def get_all_records(sheet_name):
         # Cache miss atau expired — fetch dari Google Sheets
         worksheet = get_sheet(sheet_name)
         records = worksheet.get_all_records()
-        logger.info(f"Berhasil mengambil {len(records)} record dari '{sheet_name}' (fresh fetch)")
+        logger.info(
+            f"Berhasil mengambil {len(records)} record dari '{sheet_name}' (fresh fetch)"
+        )
 
         # Simpan ke cache
         _cache[sheet_name] = (now, records)
@@ -143,9 +219,10 @@ def get_karyawan_list():
 
 def ensure_login_log_sheet():
     """
-    Memastikan tab 'Login_Log' ada di spreadsheet.
-    Jika belum ada, buat tab baru dengan header row.
-    Columns: Timestamp | Username | Status | Method | IP
+    Memastikan tab 'Login_Log' dan 'Lockout_State' ada di spreadsheet.
+
+    Login_Log columns  : Timestamp | Username | Status | Method | IP
+    Lockout_State cols : Username | AttemptCount | LastAttempt | LockedUntil
     """
     try:
         sheet_id = os.getenv("GOOGLE_SHEET_ID")
@@ -155,21 +232,94 @@ def ensure_login_log_sheet():
         client = get_client()
         spreadsheet = client.open_by_key(sheet_id)
 
-        # Cek apakah worksheet sudah ada
+        # --- Login_Log ---
         try:
             spreadsheet.worksheet("Login_Log")
             logger.info("Tab 'Login_Log' sudah ada")
         except gspread.exceptions.WorksheetNotFound:
-            # Buat worksheet baru dengan header
-            worksheet = spreadsheet.add_worksheet(
-                title="Login_Log", rows=1000, cols=5
-            )
+            worksheet = spreadsheet.add_worksheet(title="Login_Log", rows=1000, cols=5)
             headers = ["Timestamp", "Username", "Status", "Method", "IP"]
             worksheet.append_row(headers, value_input_option="USER_ENTERED")
             logger.info("Tab 'Login_Log' berhasil dibuat dengan header")
 
+        # --- Lockout_State ---
+        try:
+            spreadsheet.worksheet("Lockout_State")
+            logger.info("Tab 'Lockout_State' sudah ada")
+        except gspread.exceptions.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet(title="Lockout_State", rows=200, cols=4)
+            ws.append_row(
+                ["Username", "AttemptCount", "LastAttempt", "LockedUntil"],
+                value_input_option="USER_ENTERED",
+            )
+            logger.info("Tab 'Lockout_State' berhasil dibuat")
+
     except Exception as e:
-        logger.error(f"Gagal memastikan tab Login_Log: {e}")
+        logger.error(f"Gagal memastikan tab Login_Log/Lockout_State: {e}")
+
+
+# ============================================================
+# Lockout state persistence
+# ============================================================
+
+
+def load_lockout_state(username: str) -> dict:
+    """
+    Load persisted lockout state for a username from the Lockout_State sheet.
+
+    Returns:
+        dict: {
+            'attempt_count': int,
+            'last_attempt': float (unix timestamp, 0 if none),
+            'locked_until': float (unix timestamp, 0 if not locked),
+        }
+    """
+    default = {"attempt_count": 0, "last_attempt": 0.0, "locked_until": 0.0}
+    try:
+        ws = get_sheet("Lockout_State")
+        records = ws.get_all_records()  # [{Username, AttemptCount, ...}, ...]
+        for row in records:
+            if str(row.get("Username", "")).lower() == username.lower():
+                return {
+                    "attempt_count": int(row.get("AttemptCount", 0) or 0),
+                    "last_attempt": float(row.get("LastAttempt", 0) or 0),
+                    "locked_until": float(row.get("LockedUntil", 0) or 0),
+                }
+        return default
+    except Exception as e:
+        logger.error(f"Gagal membaca lockout state untuk '{username}': {e}")
+        return default
+
+
+def save_lockout_state(
+    username: str, attempt_count: int, last_attempt: float, locked_until: float
+) -> None:
+    """
+    Upsert the lockout row for a username in the Lockout_State sheet.
+    Performed synchronously (no queue) because we need the write to
+    survive a server restart — this is called sparingly (only on failed
+    attempts / lockout events).
+    """
+    try:
+        ws = get_sheet("Lockout_State")
+        records = ws.get_all_records()
+
+        row_data = [username, attempt_count, last_attempt, locked_until]
+
+        # Find existing row index (1-based; +2 because header is row 1)
+        for idx, row in enumerate(records):
+            if str(row.get("Username", "")).lower() == username.lower():
+                sheet_row = idx + 2  # +1 header, +1 for 1-based index
+                ws.update(f"A{sheet_row}:D{sheet_row}", [row_data])
+                logger.info(f"Lockout state updated untuk '{username}': {row_data}")
+                return
+
+        # No existing row — append new
+        ws.append_row(row_data, value_input_option="USER_ENTERED")
+        logger.info(f"Lockout state created untuk '{username}': {row_data}")
+
+    except Exception as e:
+        logger.error(f"Gagal menyimpan lockout state untuk '{username}': {e}")
 
 
 def log_login_attempt(username, status, method, ip):
@@ -188,9 +338,6 @@ def log_login_attempt(username, status, method, ip):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         row_data = [timestamp, username, status, method, ip]
         append_row("Login_Log", row_data)
-        logger.info(
-            f"Login attempt dicatat: {username} | {status} | {method} | {ip}"
-        )
+        logger.info(f"Login attempt dicatat: {username} | {status} | {method} | {ip}")
     except Exception as e:
         logger.error(f"Gagal mencatat login attempt ke Login_Log: {e}")
-

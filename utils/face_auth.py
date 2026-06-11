@@ -4,9 +4,9 @@ Semua logic face recognition untuk verifikasi wajah admin.
 Menggunakan library face_recognition + OpenCV.
 """
 
-import os
-import logging
 import base64
+import logging
+import os
 
 import cv2
 import numpy as np
@@ -22,6 +22,7 @@ _face_recognition_available = False
 
 try:
     import face_recognition
+
     _face_recognition_available = True
     logger.info("Library face_recognition berhasil dimuat")
 except ImportError:
@@ -67,9 +68,7 @@ def load_admin_faces():
                 encodings = face_recognition.face_encodings(image)
 
                 if len(encodings) == 0:
-                    logger.warning(
-                        f"Tidak ada wajah terdeteksi di foto: {filename}"
-                    )
+                    logger.warning(f"Tidak ada wajah terdeteksi di foto: {filename}")
                     continue
 
                 if len(encodings) > 1:
@@ -87,16 +86,12 @@ def load_admin_faces():
                 # Fallback: simpan path saja, verifikasi pakai Haar Cascade
                 _admin_face_encodings[name.lower()] = filepath
                 loaded_count += 1
-                logger.info(
-                    f"Path foto disimpan (fallback mode) untuk: {name}"
-                )
+                logger.info(f"Path foto disimpan (fallback mode) untuk: {name}")
 
         except Exception as e:
             logger.error(f"Gagal memuat foto admin '{filename}': {e}")
 
-    logger.info(
-        f"Total {loaded_count} foto admin berhasil dimuat dari '{faces_dir}'"
-    )
+    logger.info(f"Total {loaded_count} foto admin berhasil dimuat dari '{faces_dir}'")
 
 
 def verify_face(username, image_base64):
@@ -121,8 +116,9 @@ def verify_face(username, image_base64):
         return {
             "match": False,
             "message": f"Foto referensi untuk '{username}' tidak ditemukan. "
-                       f"Pastikan file {username}.jpg ada di folder admin_faces.",
+            f"Pastikan file {username}.jpg ada di folder admin_faces.",
             "confidence": 1.0,
+            "method": "none",
         }
 
     try:
@@ -133,6 +129,7 @@ def verify_face(username, image_base64):
                 "match": False,
                 "message": "Format gambar tidak valid atau gagal di-decode.",
                 "confidence": 1.0,
+                "method": "none",
             }
 
         # Convert bytes ke numpy array (OpenCV format)
@@ -144,13 +141,21 @@ def verify_face(username, image_base64):
                 "match": False,
                 "message": "Gagal membaca gambar. Pastikan format gambar valid.",
                 "confidence": 1.0,
+                "method": "none",
             }
 
         # Jalankan verifikasi berdasarkan library yang tersedia
         if _face_recognition_available:
-            return _verify_with_face_recognition(username_lower, cv_image)
+            result = _verify_with_face_recognition(username_lower, cv_image)
         else:
-            return _verify_with_opencv_fallback(username_lower, cv_image)
+            result = _verify_with_opencv_fallback(username_lower, cv_image)
+
+        # Log method used
+        logger.info(
+            f"Face verification method='{result.get('method')}' "
+            f"for '{username}', match={result.get('match')}"
+        )
+        return result
 
     except Exception as e:
         logger.error(f"Error saat verifikasi wajah untuk '{username}': {e}")
@@ -158,6 +163,7 @@ def verify_face(username, image_base64):
             "match": False,
             "message": "Terjadi kesalahan saat memproses verifikasi wajah.",
             "confidence": 1.0,
+            "method": "none",
         }
 
 
@@ -210,8 +216,9 @@ def _verify_with_face_recognition(username, cv_image):
         return {
             "match": False,
             "message": "Tidak ada wajah terdeteksi dalam gambar. "
-                       "Pastikan wajah terlihat jelas dan pencahayaan cukup.",
+            "Pastikan wajah terlihat jelas dan pencahayaan cukup.",
             "confidence": 1.0,
+            "method": "face_recognition",
         }
 
     # Encode wajah yang terdeteksi
@@ -222,6 +229,7 @@ def _verify_with_face_recognition(username, cv_image):
             "match": False,
             "message": "Gagal menghasilkan encoding wajah dari gambar.",
             "confidence": 1.0,
+            "method": "face_recognition",
         }
 
     # Bandingkan dengan foto referensi (gunakan wajah pertama yang terdeteksi)
@@ -242,6 +250,7 @@ def _verify_with_face_recognition(username, cv_image):
             "match": True,
             "message": "Verifikasi wajah berhasil!",
             "confidence": round(float(face_distance), 4),
+            "method": "face_recognition",
         }
     else:
         logger.warning(
@@ -251,8 +260,9 @@ def _verify_with_face_recognition(username, cv_image):
         return {
             "match": False,
             "message": "Wajah tidak dikenali. Pastikan wajah Anda terlihat "
-                       "jelas dan cocok dengan foto referensi.",
+            "jelas dan cocok dengan foto referensi.",
             "confidence": round(float(face_distance), 4),
+            "method": "face_recognition",
         }
 
 
@@ -286,8 +296,9 @@ def _verify_with_opencv_fallback(username, cv_image):
         return {
             "match": False,
             "message": "Tidak ada wajah terdeteksi dalam gambar. "
-                       "Pastikan wajah terlihat jelas dan pencahayaan cukup.",
+            "Pastikan wajah terlihat jelas dan pencahayaan cukup.",
             "confidence": 1.0,
+            "method": "opencv_fallback",
         }
 
     # Load dan proses foto referensi
@@ -297,6 +308,7 @@ def _verify_with_opencv_fallback(username, cv_image):
             "match": False,
             "message": "Gagal membaca foto referensi admin.",
             "confidence": 1.0,
+            "method": "opencv_fallback",
         }
 
     gray_ref = cv2.cvtColor(ref_image, cv2.COLOR_BGR2GRAY)
@@ -309,14 +321,15 @@ def _verify_with_opencv_fallback(username, cv_image):
             "match": False,
             "message": "Tidak ada wajah terdeteksi di foto referensi admin.",
             "confidence": 1.0,
+            "method": "opencv_fallback",
         }
 
     # Crop wajah dari kedua gambar
     (x, y, w, h) = faces_input[0]
-    face_input = cv_image[y:y + h, x:x + w]
+    face_input = cv_image[y : y + h, x : x + w]
 
     (rx, ry, rw, rh) = faces_ref[0]
-    face_ref = ref_image[ry:ry + rh, rx:rx + rw]
+    face_ref = ref_image[ry : ry + rh, rx : rx + rw]
 
     # Resize ke ukuran yang sama untuk perbandingan
     target_size = (128, 128)
@@ -325,12 +338,10 @@ def _verify_with_opencv_fallback(username, cv_image):
 
     # Bandingkan menggunakan histogram correlation
     hist_input = cv2.calcHist(
-        [face_input_resized], [0, 1, 2], None,
-        [32, 32, 32], [0, 256, 0, 256, 0, 256]
+        [face_input_resized], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256]
     )
     hist_ref = cv2.calcHist(
-        [face_ref_resized], [0, 1, 2], None,
-        [32, 32, 32], [0, 256, 0, 256, 0, 256]
+        [face_ref_resized], [0, 1, 2], None, [32, 32, 32], [0, 256, 0, 256, 0, 256]
     )
 
     cv2.normalize(hist_input, hist_input)
@@ -354,6 +365,7 @@ def _verify_with_opencv_fallback(username, cv_image):
             "match": True,
             "message": "Verifikasi wajah berhasil! (mode fallback)",
             "confidence": round(float(distance), 4),
+            "method": "opencv_fallback",
         }
     else:
         logger.warning(
@@ -363,8 +375,9 @@ def _verify_with_opencv_fallback(username, cv_image):
         return {
             "match": False,
             "message": "Wajah tidak dikenali. Pastikan wajah Anda terlihat "
-                       "jelas dan cocok dengan foto referensi.",
+            "jelas dan cocok dengan foto referensi.",
             "confidence": round(float(distance), 4),
+            "method": "opencv_fallback",
         }
 
 

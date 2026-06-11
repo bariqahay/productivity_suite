@@ -5,22 +5,23 @@ Mengelola autentikasi admin dengan dua langkah:
 2. Verifikasi wajah via webcam/upload
 """
 
-import os
 import logging
+import os
 import time
 
+import bcrypt
 from flask import (
     Blueprint,
+    jsonify,
+    redirect,
     render_template,
     request,
-    jsonify,
     session,
-    redirect,
     url_for,
 )
 
-from utils.face_auth import verify_face, get_loaded_admins
-from utils.sheets import log_login_attempt
+from utils.face_auth import get_loaded_admins, verify_face
+from utils.sheets import load_lockout_state, log_login_attempt, save_lockout_state
 
 logger = logging.getLogger(__name__)
 
@@ -34,13 +35,21 @@ auth_bp = Blueprint(
 # Utilitas: Parsing admin credentials dari .env
 # ============================================
 
+
+def _is_bcrypt_hash(value: str) -> bool:
+    """Return True if value is a bcrypt hash (not plain-text)."""
+    return value.startswith(("$2b$", "$2a$", "$2y$"))
+
+
 def _get_admin_credentials():
     """
     Parse ADMIN_USERS dari .env.
-    Format: 'username1:password1,username2:password2'
+    Format: 'username1:bcrypt_hash1,username2:bcrypt_hash2'
+    Legacy plain-text passwords are still accepted here and compared
+    safely — run migrate_passwords.py to upgrade them to hashes.
 
     Returns:
-        dict: {username: password_plain_text}
+        dict: {username: password_hash_or_plain}
     """
     admin_str = os.getenv("ADMIN_USERS", "")
     credentials = {}
@@ -59,9 +68,25 @@ def _get_admin_credentials():
     return credentials
 
 
+def _check_password(plain: str, stored: str) -> bool:
+    """
+    Verify a password against a stored bcrypt hash or (legacy) plain text.
+    Always runs in constant time to prevent timing attacks.
+    """
+    if _is_bcrypt_hash(stored):
+        return bcrypt.checkpw(plain.encode("utf-8"), stored.encode("utf-8"))
+    # Legacy plain-text fallback — log a warning so admins know to migrate
+    logger.warning(
+        "Plain-text password detected in ADMIN_USERS. "
+        "Run migrate_passwords.py to upgrade to bcrypt hashes."
+    )
+    return plain == stored
+
+
 # ============================================
 # Routes
 # ============================================
+
 
 @auth_bp.route("/login")
 def login_page():
@@ -89,50 +114,54 @@ def login_submit():
     try:
         data = request.get_json()
         if not data:
-            return jsonify({
-                "success": False,
-                "message": "Data tidak valid"
-            }), 400
+            return jsonify({"success": False, "message": "Data tidak valid"}), 400
 
         username = data.get("username", "").strip().lower()
         password = data.get("password", "").strip()
         client_ip = request.remote_addr or "unknown"
 
         if not username or not password:
-            return jsonify({
-                "success": False,
-                "message": "Username dan password wajib diisi"
-            }), 400
+            return jsonify(
+                {"success": False, "message": "Username dan password wajib diisi"}
+            ), 400
 
         # Cek lockout
         lockout_status = _check_lockout(username)
         if lockout_status["locked"]:
-            return jsonify({
-                "success": False,
-                "status": "LOCKED",
-                "message": f"Akun terkunci. Coba lagi dalam "
-                           f"{lockout_status['remaining_seconds']} detik.",
-                "remaining_seconds": lockout_status["remaining_seconds"],
-            }), 423
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "LOCKED",
+                    "message": f"Akun terkunci. Coba lagi dalam "
+                    f"{lockout_status['remaining_seconds']} detik.",
+                    "remaining_seconds": lockout_status["remaining_seconds"],
+                }
+            ), 423
 
         # Validasi kredensial
         admin_creds = _get_admin_credentials()
 
         if username not in admin_creds:
             log_login_attempt(username, "FAILED_PASSWORD", "password_only", client_ip)
-            return jsonify({
-                "success": False,
-                "status": "FAILED_PASSWORD",
-                "message": "Username atau password salah"
-            }), 401
+            _record_failed_attempt(username)
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "FAILED_PASSWORD",
+                    "message": "Username atau password salah",
+                }
+            ), 401
 
-        if admin_creds[username] != password:
+        if not _check_password(password, admin_creds[username]):
             log_login_attempt(username, "FAILED_PASSWORD", "password_only", client_ip)
-            return jsonify({
-                "success": False,
-                "status": "FAILED_PASSWORD",
-                "message": "Username atau password salah"
-            }), 401
+            _record_failed_attempt(username)
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "FAILED_PASSWORD",
+                    "message": "Username atau password salah",
+                }
+            ), 401
 
         # Password valid — set pending session untuk face verification
         session["pending_user"] = username
@@ -143,15 +172,14 @@ def login_submit():
         has_face_ref = username in loaded_admins
 
         if has_face_ref:
-            logger.info(
-                f"Password valid untuk '{username}', "
-                "menunggu verifikasi wajah"
+            logger.info(f"Password valid untuk '{username}', menunggu verifikasi wajah")
+            return jsonify(
+                {
+                    "success": True,
+                    "needs_face_verification": True,
+                    "message": "Password valid. Silakan verifikasi wajah.",
+                }
             )
-            return jsonify({
-                "success": True,
-                "needs_face_verification": True,
-                "message": "Password valid. Silakan verifikasi wajah."
-            })
         else:
             # Tidak ada foto referensi — langsung login (password_only)
             session["logged_in"] = True
@@ -159,23 +187,23 @@ def login_submit():
             session.pop("pending_user", None)
             session.pop("face_attempts", None)
 
+            _reset_lockout(username)
             log_login_attempt(username, "SUCCESS", "password_only", client_ip)
             logger.info(
                 f"Login berhasil untuk '{username}' (tanpa face verification — "
                 "foto referensi tidak tersedia)"
             )
-            return jsonify({
-                "success": True,
-                "needs_face_verification": False,
-                "message": "Login berhasil! Mengarahkan ke dashboard..."
-            })
+            return jsonify(
+                {
+                    "success": True,
+                    "needs_face_verification": False,
+                    "message": "Login berhasil! Mengarahkan ke dashboard...",
+                }
+            )
 
     except Exception as e:
         logger.error(f"Error saat proses login: {e}")
-        return jsonify({
-            "success": False,
-            "message": "Terjadi kesalahan server"
-        }), 500
+        return jsonify({"success": False, "message": "Terjadi kesalahan server"}), 500
 
 
 @auth_bp.route("/verify-face", methods=["POST"])
@@ -197,20 +225,21 @@ def verify_face_endpoint():
         now = time.time()
         last_request = session.get("last_face_request", 0)
         if now - last_request < 2:
-            return jsonify({
-                "success": False,
-                "match": False,
-                "message": "Terlalu cepat. Tunggu beberapa detik sebelum mencoba lagi."
-            }), 429
+            return jsonify(
+                {
+                    "success": False,
+                    "match": False,
+                    "message": "Terlalu cepat. Tunggu beberapa detik sebelum mencoba lagi.",
+                }
+            ), 429
         session["last_face_request"] = now
 
         # Cek apakah ada pending user di session
         pending_user = session.get("pending_user")
         if not pending_user:
-            return jsonify({
-                "success": False,
-                "message": "Sesi tidak valid. Silakan login ulang."
-            }), 401
+            return jsonify(
+                {"success": False, "message": "Sesi tidak valid. Silakan login ulang."}
+            ), 401
 
         client_ip = request.remote_addr or "unknown"
         max_attempts = int(os.getenv("MAX_FACE_ATTEMPTS", "3"))
@@ -218,27 +247,35 @@ def verify_face_endpoint():
         # Cek lockout
         lockout_status = _check_lockout(pending_user)
         if lockout_status["locked"]:
-            return jsonify({
-                "success": False,
-                "status": "LOCKED",
-                "match": False,
-                "message": f"Akun terkunci. Coba lagi dalam "
-                           f"{lockout_status['remaining_seconds']} detik.",
-                "remaining_seconds": lockout_status["remaining_seconds"],
-            }), 423
+            return jsonify(
+                {
+                    "success": False,
+                    "status": "LOCKED",
+                    "match": False,
+                    "message": f"Akun terkunci. Coba lagi dalam "
+                    f"{lockout_status['remaining_seconds']} detik.",
+                    "remaining_seconds": lockout_status["remaining_seconds"],
+                }
+            ), 423
 
         data = request.get_json()
         if not data or not data.get("image"):
-            return jsonify({
-                "success": False,
-                "match": False,
-                "message": "Data gambar tidak ditemukan"
-            }), 400
+            return jsonify(
+                {
+                    "success": False,
+                    "match": False,
+                    "message": "Data gambar tidak ditemukan",
+                }
+            ), 400
 
         image_base64 = data["image"]
 
         # Jalankan verifikasi wajah
         result = verify_face(pending_user, image_base64)
+
+        face_method = result.get(
+            "method", "face_recognition"
+        )  # 'face_recognition' | 'opencv_fallback'
 
         if result["match"]:
             # Wajah cocok — login berhasil
@@ -247,74 +284,80 @@ def verify_face_endpoint():
             session.pop("pending_user", None)
             session.pop("face_attempts", None)
 
-            log_login_attempt(
-                pending_user, "SUCCESS", "password+face", client_ip
-            )
-            logger.info(f"Login berhasil untuk '{pending_user}' via face verification")
+            # Reset persistent lockout counter
+            _reset_lockout(pending_user)
 
-            return jsonify({
-                "success": True,
-                "match": True,
-                "message": "Verifikasi wajah berhasil! Mengarahkan ke dashboard...",
-                "confidence": result.get("confidence", 0),
-            })
+            log_method = f"password+face({face_method})"
+            log_login_attempt(pending_user, "SUCCESS", log_method, client_ip)
+            logger.info(
+                f"Login berhasil untuk '{pending_user}' via face verification "
+                f"(method={face_method})"
+            )
+
+            return jsonify(
+                {
+                    "success": True,
+                    "match": True,
+                    "message": "Verifikasi wajah berhasil! Mengarahkan ke dashboard...",
+                    "confidence": result.get("confidence", 0),
+                    "face_method": face_method,
+                }
+            )
 
         else:
-            # Wajah tidak cocok — increment attempts
-            face_attempts = session.get("face_attempts", 0) + 1
-            session["face_attempts"] = face_attempts
+            # Wajah tidak cocok — record attempt and check lockout
+            _record_failed_attempt(pending_user)
+            log_login_attempt(pending_user, "FAILED_FACE", "password+face", client_ip)
 
-            attempts_remaining = max_attempts - face_attempts
-
-            if attempts_remaining <= 0:
-                # Lockout — catat waktu lockout
+            # Re-load state to check if now locked
+            new_lockout = _check_lockout(pending_user)
+            if new_lockout["locked"]:
                 lockout_minutes = int(os.getenv("LOCKOUT_MINUTES", "5"))
-                session["lockout_until"] = time.time() + (lockout_minutes * 60)
-                session["lockout_user"] = pending_user
                 session.pop("pending_user", None)
                 session.pop("face_attempts", None)
 
-                log_login_attempt(
-                    pending_user, "FAILED_FACE", "password+face", client_ip
-                )
-                logger.warning(
-                    f"Akun '{pending_user}' terkunci selama {lockout_minutes} "
-                    "menit setelah 3x gagal verifikasi wajah"
-                )
-
-                return jsonify({
-                    "success": False,
-                    "match": False,
-                    "status": "LOCKED",
-                    "message": f"Verifikasi wajah gagal {max_attempts}x berturut-turut. "
-                               f"Akun terkunci selama {lockout_minutes} menit.",
-                    "remaining_seconds": lockout_minutes * 60,
-                }), 423
+                return jsonify(
+                    {
+                        "success": False,
+                        "match": False,
+                        "status": "LOCKED",
+                        "message": f"Verifikasi wajah gagal {max_attempts}x berturut-turut. "
+                        f"Akun terkunci selama {lockout_minutes} menit.",
+                        "remaining_seconds": new_lockout["remaining_seconds"],
+                    }
+                ), 423
 
             else:
-                log_login_attempt(
-                    pending_user, "FAILED_FACE", "password+face", client_ip
-                )
+                # Load current count to show remaining attempts
+                state = load_lockout_state(pending_user)
+                attempts_so_far = state["attempt_count"]
+                attempts_remaining = max(0, max_attempts - attempts_so_far)
+
                 logger.warning(
                     f"Verifikasi wajah gagal untuk '{pending_user}' "
-                    f"(percobaan {face_attempts}/{max_attempts})"
+                    f"(percobaan {attempts_so_far}/{max_attempts})"
                 )
 
-                return jsonify({
-                    "success": False,
-                    "match": False,
-                    "message": result.get("message", "Wajah tidak dikenali."),
-                    "attempts_remaining": attempts_remaining,
-                    "confidence": result.get("confidence", 1.0),
-                })
+                return jsonify(
+                    {
+                        "success": False,
+                        "match": False,
+                        "message": result.get("message", "Wajah tidak dikenali."),
+                        "attempts_remaining": attempts_remaining,
+                        "confidence": result.get("confidence", 1.0),
+                        "face_method": face_method,
+                    }
+                )
 
     except Exception as e:
         logger.error(f"Error saat verifikasi wajah: {e}")
-        return jsonify({
-            "success": False,
-            "match": False,
-            "message": "Terjadi kesalahan server saat verifikasi wajah."
-        }), 500
+        return jsonify(
+            {
+                "success": False,
+                "match": False,
+                "message": "Terjadi kesalahan server saat verifikasi wajah.",
+            }
+        ), 500
 
 
 @auth_bp.route("/logout")
@@ -329,32 +372,50 @@ def logout():
 
 
 # ============================================
-# Helper: Lockout Management
+# Helper: Lockout Management (persisted to Lockout_State sheet)
 # ============================================
 
-def _check_lockout(username):
-    """
-    Cek apakah akun admin sedang terkunci (lockout).
 
-    Args:
-        username: Username yang akan dicek.
+def _check_lockout(username: str) -> dict:
+    """
+    Cek apakah akun admin sedang terkunci.
+    State diambil dari Google Sheets (survive server restart).
 
     Returns:
-        dict: {
-            'locked': bool,
-            'remaining_seconds': int (0 jika tidak terkunci)
-        }
+        dict: {'locked': bool, 'remaining_seconds': int}
     """
-    lockout_until = session.get("lockout_until", 0)
-    lockout_user = session.get("lockout_user", "")
+    state = load_lockout_state(username)
+    locked_until = state["locked_until"]
 
-    if lockout_user == username and lockout_until > time.time():
-        remaining = int(lockout_until - time.time())
+    if locked_until > time.time():
+        remaining = int(locked_until - time.time())
         return {"locked": True, "remaining_seconds": remaining}
 
-    # Lockout sudah expired — bersihkan
-    if lockout_user == username:
-        session.pop("lockout_until", None)
-        session.pop("lockout_user", None)
-
     return {"locked": False, "remaining_seconds": 0}
+
+
+def _record_failed_attempt(username: str) -> None:
+    """
+    Increment the failed-attempt counter and persist to sheet.
+    Triggers lockout if MAX_FACE_ATTEMPTS is reached.
+    """
+    state = load_lockout_state(username)
+    new_count = state["attempt_count"] + 1
+    now = time.time()
+    max_attempts = int(os.getenv("MAX_FACE_ATTEMPTS", "3"))
+    lockout_minutes = int(os.getenv("LOCKOUT_MINUTES", "5"))
+
+    locked_until = 0.0
+    if new_count >= max_attempts:
+        locked_until = now + lockout_minutes * 60
+        logger.warning(
+            f"Akun '{username}' dikunci sampai "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(locked_until))}"
+        )
+
+    save_lockout_state(username, new_count, now, locked_until)
+
+
+def _reset_lockout(username: str) -> None:
+    """Clear lockout state after a successful login."""
+    save_lockout_state(username, 0, time.time(), 0.0)

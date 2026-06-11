@@ -4,11 +4,12 @@ Aplikasi web Flask multi-halaman untuk manajemen kehadiran,
 dashboard analytics, dan generator artikel AI.
 """
 
-import os
 import logging
+import os
 
-from flask import Flask, redirect, url_for, render_template, session, request
 from dotenv import load_dotenv
+from flask import Flask, redirect, render_template, request, session, url_for
+from flask_caching import Cache
 
 # Muat environment variables dari .env
 load_dotenv()
@@ -19,6 +20,11 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+# Shared Flask-Caching instance (filesystem backend, 1-hour TTL)
+# Initialised inside create_app() so it shares the app context.
+cache = Cache()
 
 
 def create_app():
@@ -33,11 +39,19 @@ def create_app():
     # Konfigurasi session agar bisa menyimpan data besar (word cloud base64)
     app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024  # 16MB max
 
+    # === Flask-Caching: filesystem backend for word clouds ===
+    wc_cache_dir = os.path.join(app.root_path, "static", "wordcloud_cache")
+    os.makedirs(wc_cache_dir, exist_ok=True)
+    app.config["CACHE_TYPE"] = "FileSystemCache"
+    app.config["CACHE_DIR"] = wc_cache_dir
+    app.config["CACHE_DEFAULT_TIMEOUT"] = 3600  # 1 hour
+    cache.init_app(app)
+
     # === Register Blueprints ===
-    from blueprints.auth import auth_bp
     from blueprints.absensi import absensi_bp
-    from blueprints.dashboard import dashboard_bp
     from blueprints.artikel import artikel_bp
+    from blueprints.auth import auth_bp
+    from blueprints.dashboard import dashboard_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(absensi_bp)
@@ -46,8 +60,12 @@ def create_app():
 
     # === Login Guard Global ===
     # Halaman yang tidak perlu login
-    PUBLIC_ENDPOINTS = {"auth.login_page", "auth.login_submit",
-                        "auth.verify_face_endpoint", "static"}
+    PUBLIC_ENDPOINTS = {
+        "auth.login_page",
+        "auth.login_submit",
+        "auth.verify_face_endpoint",
+        "static",
+    }
 
     @app.before_request
     def require_login():
@@ -85,8 +103,17 @@ def create_app():
 
     # === Muat face encoding admin saat app start ===
     with app.app_context():
+        # Mulai background write worker untuk Google Sheets
+        try:
+            from utils.sheets import start_write_worker
+
+            start_write_worker()
+        except Exception as e:
+            logger.warning(f"Gagal memulai Sheets write worker: {e}")
+
         try:
             from utils.face_auth import load_admin_faces
+
             load_admin_faces()
             logger.info("Face encoding admin berhasil dimuat")
         except Exception as e:
@@ -95,6 +122,7 @@ def create_app():
         # Pastikan tab Login_Log ada di Google Sheets
         try:
             from utils.sheets import ensure_login_log_sheet
+
             ensure_login_log_sheet()
         except Exception as e:
             logger.warning(f"Gagal memastikan tab Login_Log: {e}")
